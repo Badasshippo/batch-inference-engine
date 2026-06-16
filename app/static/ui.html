@@ -173,8 +173,12 @@ table.rt tr:last-child td { border-bottom: none; }
       <div class="section-title">Submit a batch</div>
       <form id="submitForm">
         <div>
-          <label class="field-label">Prompts — one per line</label>
-          <textarea id="promptsInput" placeholder="What is machine learning?&#10;Explain transformers&#10;What is a rate limiter?"></textarea>
+          <label class="field-label">
+            Prompts
+            <span style="color:var(--muted);font-weight:400"> — one per line, JSON array, or paste anything</span>
+          </label>
+          <textarea id="promptsInput" placeholder='One per line:&#10;What is machine learning?&#10;Explain transformers&#10;&#10;Or paste a JSON array:&#10;["hello", "world"]&#10;&#10;Or objects:&#10;[{"prompt":"hi"},{"prompt":"bye"}]'></textarea>
+          <div id="parseHint" style="font-size:11px;color:var(--muted);margin-top:2px;min-height:14px"></div>
         </div>
         <div class="row-2">
           <div>
@@ -229,6 +233,76 @@ table.rt tr:last-child td { border-bottom: none; }
 <div class="toasts" id="toasts"></div>
 
 <script>
+/* ── smart prompt parser ── */
+function parsePrompts(raw) {
+  const s = raw.trim();
+  if (!s) return [];
+
+  // 1. JSON array
+  if (s.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) {
+        const prompts = parsed.map(item => {
+          if (typeof item === 'string') return item.trim();
+          if (item && typeof item === 'object') {
+            // {"prompt":"..."} or {"text":"..."} or {"content":"..."} or first string value
+            return (item.prompt || item.text || item.content
+              || Object.values(item).find(v => typeof v === 'string')
+              || JSON.stringify(item)).trim();
+          }
+          return String(item).trim();
+        }).filter(Boolean);
+        return { prompts, hint: `Parsed ${prompts.length} prompts from JSON array` };
+      }
+    } catch (e) { /* fall through */ }
+  }
+
+  // 2. JSON object with a "prompts" key: {"prompts": [...]}
+  if (s.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(s);
+      const arr = parsed.prompts || parsed.items || parsed.data;
+      if (Array.isArray(arr)) {
+        const prompts = arr.map(item =>
+          typeof item === 'string' ? item.trim() : (item.prompt || item.text || '').trim()
+        ).filter(Boolean);
+        return { prompts, hint: `Parsed ${prompts.length} prompts from JSON object` };
+      }
+    } catch (e) { /* fall through */ }
+  }
+
+  // 3. Numbered list: "1. foo\n2. bar" or "1) foo"
+  const numberedLines = s.split('\n').map(l => l.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
+  if (numberedLines.length > 0 && /^\s*\d+[.)]\s/.test(s)) {
+    return { prompts: numberedLines, hint: `Parsed ${numberedLines.length} prompts from numbered list` };
+  }
+
+  // 4. Single line with commas and no newlines → CSV
+  if (!s.includes('\n') && s.includes(',') && s.split(',').length > 1) {
+    const prompts = s.split(',').map(p => p.trim()).filter(Boolean);
+    if (prompts.length > 1) {
+      return { prompts, hint: `Parsed ${prompts.length} prompts from comma-separated list` };
+    }
+  }
+
+  // 5. Default: one per line
+  const prompts = s.split('\n').map(l => l.trim()).filter(Boolean);
+  return { prompts, hint: prompts.length > 1 ? `${prompts.length} prompts (one per line)` : '' };
+}
+
+// Live parse hint as user types
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('promptsInput');
+  const hint = document.getElementById('parseHint');
+  if (ta && hint) {
+    ta.addEventListener('input', () => {
+      const result = parsePrompts(ta.value);
+      hint.textContent = result.hint || '';
+    });
+  }
+});
+
 /* ── XSS guard ── */
 function esc(str) {
   return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -390,7 +464,9 @@ document.getElementById('submitForm').addEventListener('submit', async e => {
   e.preventDefault();
   const raw = document.getElementById('promptsInput').value.trim();
   if (!raw) { toast('Enter at least one prompt.', 'err'); return; }
-  const prompts = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  const { prompts, hint } = parsePrompts(raw);
+  if (!prompts.length) { toast('Could not parse any prompts from input.', 'err'); return; }
+  if (hint) document.getElementById('parseHint').textContent = hint;
   const priority = document.getElementById('priority').value;
   const ikey = document.getElementById('ikey').value.trim() || `ui-${Date.now()}`;
   const apiKey = document.getElementById('apiKey').value.trim();
