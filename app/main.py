@@ -13,11 +13,13 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
-from .engine import BatchEngine
+from .engine import BatchEngine, OverloadedError
+from .logging_config import get_logger, setup_logging
+from .metrics import metrics
 from .models import (
     BatchRequest,
     JobResultsResponse,
@@ -26,14 +28,19 @@ from .models import (
     SubmitResponse,
 )
 
+log = get_logger("api")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_logging()
     app.state.engine = BatchEngine()
+    log.info("service started", extra={"version": __version__})
     try:
         yield
     finally:
         await app.state.engine.shutdown()
+        log.info("service stopped")
 
 
 app = FastAPI(
@@ -63,9 +70,24 @@ def _ack(job, request: Request) -> SubmitResponse:
     )
 
 
+def _overloaded(exc: OverloadedError) -> HTTPException:
+    """Translate an OverloadedError into a 503 with a Retry-After header."""
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=str(exc),
+        headers={"Retry-After": str(exc.retry_after)},
+    )
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def prometheus_metrics() -> str:
+    """Prometheus exposition endpoint (text format v0.0.4)."""
+    return metrics.render()
 
 
 @app.get("/")
@@ -84,7 +106,10 @@ async def root() -> dict[str, str]:
 )
 async def submit_batch(payload: BatchRequest, request: Request) -> SubmitResponse:
     """Accept a JSON array of prompts and start background processing."""
-    job = await _engine(request).submit(payload.prompts)
+    try:
+        job = await _engine(request).submit(payload.prompts)
+    except OverloadedError as exc:
+        raise _overloaded(exc) from exc
     return _ack(job, request)
 
 
@@ -124,7 +149,10 @@ async def upload_batch(request: Request, file: UploadFile = File(...)) -> Submit
                 detail=f"Item {i} must be a string or an object with a 'prompt' field.",
             )
 
-    job = await _engine(request).submit(prompts)
+    try:
+        job = await _engine(request).submit(prompts)
+    except OverloadedError as exc:
+        raise _overloaded(exc) from exc
     return _ack(job, request)
 
 
@@ -138,19 +166,46 @@ async def job_status(job_id: str, request: Request) -> JobStatusResponse:
 
 
 @app.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
-async def job_results(job_id: str, request: Request) -> JobResultsResponse:
-    """Return the aggregated results for a job (partial if still running)."""
+async def job_results(
+    job_id: str,
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000, description="Max results to return."),
+    offset: int = Query(0, ge=0, description="Number of results to skip."),
+) -> JobResultsResponse:
+    """Return the aggregated results for a job (partial if still running).
+
+    Results are paginated; a 1,000-prompt job should not return everything in a
+    single response by default.
+    """
     job = _engine(request).get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    ordered = job.ordered_results()
+    page = ordered[offset : offset + limit]
     return JobResultsResponse(
         job_id=job.id,
         state=job.state,
         total=job.total,
         succeeded=job.succeeded,
         failed=job.failed,
-        results=list(job.results.values()),
+        returned=len(page),
+        limit=limit,
+        offset=offset,
+        results=page,
     )
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
+async def cancel_job(job_id: str, request: Request) -> JobStatusResponse:
+    """Request cancellation of a running job."""
+    engine = _engine(request)
+    outcome = await engine.cancel(job_id)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    if outcome is False:
+        raise HTTPException(status_code=409, detail="Job has already finished.")
+    job = engine.get_job(job_id)
+    return JobStatusResponse(**job.snapshot())
 
 
 @app.exception_handler(Exception)

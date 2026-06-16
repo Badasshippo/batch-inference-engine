@@ -7,14 +7,18 @@ producer/worker-pool pattern built on asyncio primitives:
 
     prompts --> [bounded asyncio.Queue] --> N worker coroutines --> results
 
-* A single producer enqueues prompts into a *bounded* queue. Because the queue
-  has a max size, enqueueing applies backpressure and memory stays bounded even
-  for very large batches (e.g. 1,000+ prompts).
-* Exactly `worker_pool_size` worker coroutines drain the queue. This caps the
-  number of in-flight inference calls, so we never spawn unbounded tasks.
-* Each worker runs `infer_with_retry`, which handles HTTP 429 responses with
-  exponential backoff + jitter. A prompt that exhausts its retries is recorded
-  as a failed item but never crashes the worker or the batch.
+* A single producer enqueues work into a *bounded* queue. Because the queue has
+  a max size, enqueueing applies backpressure so pending work cannot grow without
+  limit. (Note: this bounds *in-flight* work, not total process memory -- the
+  prompt list itself is held in RAM. See README "Tradeoffs".)
+* Exactly `worker_pool_size` worker coroutines drain the queue per job. On top of
+  that, a process-wide semaphore (`global_max_concurrency`) caps the number of
+  inference calls in flight across *all* jobs, so concurrent batches cannot
+  multiply concurrency and exhaust the upstream / memory.
+* Each worker runs `infer_with_retry`, which handles HTTP 429 with exponential
+  backoff + jitter. Any per-prompt failure (exhausted retries, non-retryable
+  error, or an unexpected exception) is recorded as a failed item and never
+  crashes the worker or the batch.
 
 This module is deliberately framework-agnostic (no FastAPI imports) so it can be
 unit tested in isolation.
@@ -27,16 +31,28 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 
 from .config import Settings, get_settings
+from .logging_config import get_logger
+from .metrics import metrics
 from .mock_inference import InferenceError, MockInferenceClient, RateLimitError
-from .models import InferenceResult, Job, JobState, PromptItem
+from .models import InferenceResult, Job, JobState, PromptItem, WorkItem
 
 # A coroutine function that maps a prompt string to a completion string.
 InferFn = Callable[[str], Awaitable[str]]
 SleepFn = Callable[[float], Awaitable[None]]
 
+log = get_logger()
+
+
+class OverloadedError(Exception):
+    """Raised when the service refuses a batch due to backpressure limits."""
+
+    def __init__(self, retry_after: int, message: str = "Service overloaded") -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 def compute_backoff(attempt: int, settings: Settings, rng: random.Random | None = None) -> float:
-    """Exponential backoff with full jitter for a given (1-based) attempt.
+    """Exponential backoff with jitter for a given (1-based) attempt.
 
     delay = min(base * 2**(attempt-1), max) + jitter
     """
@@ -103,56 +119,104 @@ class BatchEngine:
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self._accepting = True
+        # Process-wide cap on concurrent inference calls across all jobs.
+        self._global_sem = asyncio.Semaphore(self.settings.global_max_concurrency)
 
     # ----------------------------- public API ----------------------------- #
+    @property
+    def active_jobs(self) -> int:
+        return len(self._tasks)
+
     async def submit(self, prompts: Sequence[PromptItem]) -> Job:
-        """Register a job and kick off background processing immediately."""
+        """Register a job and kick off background processing immediately.
+
+        Raises OverloadedError (-> HTTP 503) if the service is shutting down or
+        already running its maximum number of concurrent jobs.
+        """
+        if not self._accepting:
+            raise OverloadedError(
+                self.settings.overload_retry_after_seconds, "Service is shutting down"
+            )
+        if self.active_jobs >= self.settings.max_active_jobs:
+            metrics.jobs_rejected.inc()
+            raise OverloadedError(self.settings.overload_retry_after_seconds)
+
+        metrics.jobs_submitted.inc()
         job = Job(total=len(prompts))
+        # Assign stable, collision-free identities *before* processing starts.
+        items = [
+            WorkItem(seq=i, id=(p.id or f"prompt-{i + 1}"), prompt=p.prompt)
+            for i, p in enumerate(prompts)
+        ]
         async with self._lock:
             self._jobs[job.id] = job
-        # Fire-and-forget: processing continues after we return the ack.
-        task = asyncio.create_task(self._run_job(job, list(prompts)))
+
+        task = asyncio.create_task(self._run_job(job, items))
         self._tasks[job.id] = task
         task.add_done_callback(lambda t: self._tasks.pop(job.id, None))
+        log.info("job submitted", extra={"job_id": job.id, "total": job.total})
         return job
 
     def get_job(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
+    async def cancel(self, job_id: str) -> bool | None:
+        """Cancel a running job. Returns True if cancelled, False if already
+        finished, or None if the job is unknown."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if job.state in (JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED):
+            return False
+        job.state = JobState.CANCELLED
+        task = self._tasks.get(job_id)
+        if task is not None:
+            task.cancel()
+        log.info("job cancellation requested", extra={"job_id": job_id})
+        return True
+
     async def shutdown(self) -> None:
-        """Cancel any in-flight jobs (used on app shutdown)."""
+        """Graceful shutdown: stop accepting new jobs, let in-flight prompts
+        finish for up to `graceful_shutdown_seconds`, then cancel the rest."""
+        self._accepting = False
         tasks = list(self._tasks.values())
-        for t in tasks:
+        if not tasks:
+            return
+        log.info(
+            "graceful shutdown started",
+            extra={"active_jobs": len(tasks), "grace_s": self.settings.graceful_shutdown_seconds},
+        )
+        done, pending = await asyncio.wait(
+            tasks, timeout=self.settings.graceful_shutdown_seconds
+        )
+        for t in pending:
             t.cancel()
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+        await asyncio.gather(*pending, return_exceptions=True)
+        log.info(
+            "graceful shutdown complete",
+            extra={"finished": len(done), "force_cancelled": len(pending)},
+        )
 
     # --------------------------- internal logic --------------------------- #
-    async def _run_job(self, job: Job, prompts: list[PromptItem]) -> None:
+    async def _run_job(self, job: Job, items: list[WorkItem]) -> None:
         job.state = JobState.RUNNING
         job.started_at = time.time()
 
-        queue: asyncio.Queue[PromptItem] = asyncio.Queue(maxsize=self.settings.max_queue_size)
+        queue: asyncio.Queue[WorkItem] = asyncio.Queue(maxsize=self.settings.max_queue_size)
 
         async def producer() -> None:
-            for item in prompts:
+            for item in items:
                 await queue.put(item)  # blocks when full -> backpressure
 
         async def worker() -> None:
             while True:
-                try:
-                    item = await queue.get()
-                except asyncio.CancelledError:
-                    raise
+                item = await queue.get()
                 try:
                     await self._process_item(job, item)
                 finally:
                     queue.task_done()
 
-        # Start the bounded worker pool.
         n_workers = max(1, self.settings.worker_pool_size)
         workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
         producer_task = asyncio.create_task(producer())
@@ -161,45 +225,80 @@ class BatchEngine:
             await producer_task
             await queue.join()  # wait until every prompt is processed
             job.state = JobState.COMPLETED
+            metrics.jobs_completed.inc()
         except asyncio.CancelledError:
-            job.state = JobState.FAILED
+            # Distinguish an intentional cancel from an unexpected failure.
+            if job.state != JobState.CANCELLED:
+                job.state = JobState.FAILED
+            else:
+                metrics.jobs_cancelled.inc()
             raise
         finally:
+            producer_task.cancel()
             for w in workers:
                 w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            await asyncio.gather(producer_task, *workers, return_exceptions=True)
             job.finished_at = time.time()
-
-    async def _process_item(self, job: Job, item: PromptItem) -> None:
-        prompt_id = item.id or f"prompt-{job.completed + 1}"
-
-        def _count_retry(_attempt: int, _delay: float) -> None:
-            job.retries += 1
-
-        try:
-            output, attempts = await infer_with_retry(
-                self._infer,
-                item.prompt,
-                self.settings,
-                on_retry=_count_retry,
+            if job.started_at is not None:
+                metrics.job_duration.observe(job.finished_at - job.started_at)
+            log.info(
+                "job finished",
+                extra={
+                    "job_id": job.id,
+                    "state": job.state.value,
+                    "succeeded": job.succeeded,
+                    "failed": job.failed,
+                    "retries": job.retries,
+                },
             )
+
+    async def _process_item(self, job: Job, item: WorkItem) -> None:
+        start = time.perf_counter()
+
+        def _on_retry(_attempt: int, _delay: float) -> None:
+            job.retries += 1
+            metrics.inference_retries.inc()
+            metrics.inference_rate_limited.inc()
+
+        status = "succeeded"
+        try:
+            # The global semaphore caps inference concurrency across all jobs.
+            async with self._global_sem:
+                output, attempts = await infer_with_retry(
+                    self._infer,
+                    item.prompt,
+                    self.settings,
+                    on_retry=_on_retry,
+                )
             result = InferenceResult(
-                id=prompt_id,
-                prompt=item.prompt,
-                success=True,
-                output=output,
-                attempts=attempts,
+                id=item.id, prompt=item.prompt, success=True, output=output, attempts=attempts
             )
             job.succeeded += 1
-        except (RateLimitError, InferenceError) as exc:
+            metrics.prompts_succeeded.inc()
+        except asyncio.CancelledError:
+            # Job is being cancelled; propagate so the worker can stop.
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate any per-prompt failure
+            status = "failed"
             result = InferenceResult(
-                id=prompt_id,
-                prompt=item.prompt,
-                success=False,
-                error=str(exc),
+                id=item.id, prompt=item.prompt, success=False, error=str(exc)
             )
             job.failed += 1
+            metrics.prompts_failed.inc()
         finally:
             job.completed += 1
+            metrics.prompts_completed.inc()
 
-        job.results[prompt_id] = result
+        latency = time.perf_counter() - start
+        metrics.inference_latency.observe(latency)
+        job.results[item.seq] = result
+        log.info(
+            "prompt processed",
+            extra={
+                "job_id": job.id,
+                "prompt_id": item.id,
+                "status": status,
+                "attempts": result.attempts,
+                "latency_ms": round(latency * 1000, 2),
+            },
+        )

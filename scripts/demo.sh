@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Boots the API, submits a 1,000-prompt batch, polls progress, and prints a
-# sample of the aggregated results. Used for local verification.
+# Boots the API, submits a 1,000-prompt batch, polls progress, shows the
+# aggregated results (paginated), Prometheus metrics, and a cancellation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,6 +30,19 @@ for _ in $(seq 1 15); do
   sleep 0.4
 done
 
-echo "=== aggregated results (sample) ==="
-curl -s "http://127.0.0.1:8000/jobs/$JOB/results" \
-  | jq -c '{total,succeeded,failed,first_result:.results[0]}'
+echo "=== aggregated results (paginated: limit=2) ==="
+curl -s "http://127.0.0.1:8000/jobs/$JOB/results?limit=2&offset=0" \
+  | jq -c '{total,succeeded,failed,returned,limit,offset,first:.results[0].id}'
+
+echo "=== prometheus /metrics (sample) ==="
+curl -s http://127.0.0.1:8000/metrics \
+  | grep -E '^(batch_jobs_submitted_total|batch_prompts_completed_total|inference_retries_total|inference_rate_limited_total) '
+
+echo "=== cancellation demo (new job, cancelled mid-flight) ==="
+JOB2=$(curl -s -X POST http://127.0.0.1:8000/batches/upload \
+  -F "file=@data/prompts_1000.json" | jq -r .job_id)
+sleep 0.3
+curl -s -X POST "http://127.0.0.1:8000/jobs/$JOB2/cancel" | jq -c '{state,progress}'
+
+echo "=== sample structured logs ==="
+grep -m 2 '"msg": "prompt processed"' data/server.log || tail -n 3 data/server.log

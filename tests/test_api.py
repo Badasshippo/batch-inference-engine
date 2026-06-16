@@ -35,6 +35,30 @@ async def test_healthz(client):
     assert resp.json()["status"] == "ok"
 
 
+async def test_metrics_endpoint_exposes_prometheus(client):
+    resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    body = resp.text
+    assert "# TYPE batch_jobs_submitted_total counter" in body
+    assert "inference_latency_seconds_bucket" in body
+
+
+async def test_results_pagination(client):
+    prompts = [{"prompt": f"p{i}"} for i in range(25)]
+    ack = (await client.post("/batches", json={"prompts": prompts})).json()
+    status_path = "/jobs/" + ack["job_id"]
+    await _poll_until_complete(client, status_path)
+
+    page = (await client.get(status_path + "/results?limit=10&offset=0")).json()
+    assert page["limit"] == 10
+    assert page["returned"] == 10
+    assert len(page["results"]) == 10
+
+    last = (await client.get(status_path + "/results?limit=10&offset=20")).json()
+    assert last["returned"] == 5
+
+
 async def test_submit_and_track_batch(client):
     prompts = [{"id": f"p{i}", "prompt": f"hello {i}"} for i in range(40)]
     resp = await client.post("/batches", json={"prompts": prompts})

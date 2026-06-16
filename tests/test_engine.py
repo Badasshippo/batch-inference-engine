@@ -81,7 +81,10 @@ async def test_non_retryable_failures_are_isolated():
     assert job.state == JobState.COMPLETED
     assert job.failed == 1
     assert job.succeeded == 4
-    assert job.results["p1"].success is False
+    # "prompt-1" is at index 1 -> results keyed by stable seq.
+    failed = [r for r in job.results.values() if not r.success]
+    assert len(failed) == 1
+    assert failed[0].id == "p1"
 
 
 async def test_worker_pool_is_bounded():

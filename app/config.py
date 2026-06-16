@@ -34,6 +34,20 @@ class Settings:
     # backpressure so a huge batch cannot balloon memory usage.
     max_queue_size: int = _get_int("MAX_QUEUE_SIZE", 10_000)
 
+    # Global cap on concurrent inference calls *across all jobs*. Each job runs
+    # its own worker pool, so without this a flood of concurrent batches could
+    # multiply concurrency. This semaphore is the true system-wide limit.
+    global_max_concurrency: int = _get_int("GLOBAL_MAX_CONCURRENCY", 64)
+
+    # API-level backpressure: refuse new batches (HTTP 503 + Retry-After) once
+    # this many jobs are actively running, so the service degrades gracefully
+    # instead of falling over under load.
+    max_active_jobs: int = _get_int("MAX_ACTIVE_JOBS", 50)
+    overload_retry_after_seconds: int = _get_int("OVERLOAD_RETRY_AFTER_SECONDS", 5)
+
+    # How long to let in-flight prompts finish during a graceful shutdown.
+    graceful_shutdown_seconds: float = _get_float("GRACEFUL_SHUTDOWN_SECONDS", 10.0)
+
     # Retry / backoff policy for HTTP 429 (and transient errors).
     max_retries: int = _get_int("MAX_RETRIES", 5)
     backoff_base_seconds: float = _get_float("BACKOFF_BASE_SECONDS", 0.2)

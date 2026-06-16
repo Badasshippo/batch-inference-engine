@@ -31,6 +31,7 @@ class JobState(str, enum.Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class SubmitResponse(BaseModel):
@@ -79,12 +80,30 @@ class JobResultsResponse(BaseModel):
     total: int
     succeeded: int
     failed: int
+    returned: int = 0
+    limit: int = 0
+    offset: int = 0
     results: list[InferenceResult]
 
 
 # --------------------------------------------------------------------------- #
 # Internal (non-serialized) structures
 # --------------------------------------------------------------------------- #
+@dataclass
+class WorkItem:
+    """A unit of work with a stable, collision-free identity.
+
+    `seq` is assigned once at submission time and is globally unique within the
+    job. `id` is the user-facing identifier (their own id, or a generated
+    `prompt-N`). Keying results by `seq` means concurrent workers can never
+    overwrite each other even if prompts share (or omit) an id.
+    """
+
+    seq: int
+    id: str
+    prompt: str
+
+
 @dataclass
 class Job:
     """In-memory record of a batch job and its live progress counters."""
@@ -99,7 +118,12 @@ class Job:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
-    results: dict[str, InferenceResult] = field(default_factory=dict)
+    # Keyed by WorkItem.seq (unique per item) to prevent result collisions.
+    results: dict[int, InferenceResult] = field(default_factory=dict)
+
+    def ordered_results(self) -> list[InferenceResult]:
+        """Results in submission order."""
+        return [self.results[k] for k in sorted(self.results)]
 
     def snapshot(self) -> dict[str, Any]:
         """Return a consistent point-in-time view of progress counters."""

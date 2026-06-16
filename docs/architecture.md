@@ -61,7 +61,10 @@ flowchart TD
 |---|---|
 | **Immediate acknowledgment** | `submit()` registers the `Job` and schedules an `asyncio` background task, then returns `202 Accepted` with `job_id` + status URLs. The request never blocks on processing. |
 | **Concurrent processing** | A fixed set of `WORKER_POOL_SIZE` worker coroutines drain a shared queue, so prompts are processed in parallel instead of sequentially. |
-| **Bounded concurrency** | Concurrency is capped two ways: a fixed number of workers (in-flight calls) and a `maxsize`-bounded queue (pending work). Memory stays flat even for huge batches. |
+| **Bounded concurrency** | Concurrency is capped three ways: a fixed worker pool per job, a `maxsize`-bounded queue (pending work), and a process-wide semaphore (`GLOBAL_MAX_CONCURRENCY`) limiting in-flight inference across *all* jobs. This bounds in-flight work; see the note below on memory. |
+| **API backpressure** | `submit` rejects new batches with `503 + Retry-After` once `MAX_ACTIVE_JOBS` are running, so the service degrades gracefully instead of collapsing under load. |
+| **Observability** | Structured JSON logs (`job_id`, `prompt_id`, `attempt`, `status`, `latency_ms`) and a Prometheus `/metrics` endpoint (counters + latency/duration histograms). |
+| **Graceful shutdown** | On shutdown the engine stops accepting jobs, lets in-flight prompts drain for `GRACEFUL_SHUTDOWN_SECONDS`, then cancels cleanly — ideal for rolling deploys. |
 | **Rate-limit handling** | `infer_with_retry()` catches `RateLimitError` (429) and sleeps using exponential backoff + jitter, honoring a `Retry-After` hint, up to `MAX_RETRIES`. Prompts are never dropped on a transient 429. |
 | **Resilience** | A prompt that exhausts retries (or hits a non-retryable 500) is recorded as a failed item; the worker and the rest of the batch continue. |
 | **Result aggregation** | Each worker writes its `InferenceResult` into the job's result map and increments counters; `/jobs/{id}/results` returns the compiled JSON. |
@@ -73,8 +76,15 @@ The engine uses a **producer / bounded-queue / worker-pool** pattern on a single
 asyncio event loop:
 
 1. **Producer** iterates the batch and `await queue.put(item)`. Because the queue
-   is bounded, `put` suspends when full — this is backpressure that keeps memory
-   bounded regardless of batch size.
+   is bounded, `put` suspends when full — this is backpressure that bounds the
+   amount of *in-flight* work.
+
+> **Memory note (honest scoping).** The queue and worker pool bound *in-flight*
+> work, not total process memory: the submitted prompt list and the aggregated
+> results are held in RAM for the life of the job, and file uploads are read
+> fully into memory. This is fine for batches of thousands. For truly flat
+> memory on huge inputs you'd add streaming/file-backed ingestion and a
+> spill-to-disk/DB result store (see README "Tradeoffs").
 2. **Workers** (`N = WORKER_POOL_SIZE`) loop on `await queue.get()`, process one
    prompt at a time, and call `queue.task_done()`. The pool size is the hard cap
    on simultaneous inference calls.

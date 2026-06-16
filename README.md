@@ -18,12 +18,25 @@ work runs in the background on a **bounded worker pool**.
   queue, instead of running prompts sequentially.
 - **Rate-limit handling** — workers retry `429 Too Many Requests` with exponential
   backoff + jitter (honoring `Retry-After`), so prompts are never dropped.
-- **Bounded concurrency** — fixed worker count **and** a bounded queue keep memory
-  flat and prevent unbounded task spawning.
-- **Result aggregation** — successful completions are compiled into a JSON result
-  set, queryable per job.
+- **Bounded concurrency** — fixed worker pool, a bounded queue, **and** a global
+  semaphore cap in-flight inference across all jobs (no unbounded task spawning).
+- **Result aggregation** — successful completions are compiled into a paginated
+  JSON result set, queryable per job.
 - **Job status API** — poll live progress (e.g. `400/1000 completed`, retries,
   duration).
+
+Operational maturity (cloud-ready):
+
+- **API backpressure** — returns `503 + Retry-After` once `MAX_ACTIVE_JOBS` are
+  running, instead of collapsing under load.
+- **Observability** — Prometheus `/metrics` (counters + latency/duration
+  histograms) and structured JSON logs (`job_id`, `prompt_id`, `attempt`,
+  `status`, `latency_ms`).
+- **Graceful shutdown** — drains in-flight prompts before exit (rolling-deploy
+  friendly).
+- **Job cancellation** — `POST /jobs/{id}/cancel`.
+- **Container-ready** — non-root `Dockerfile` with a `HEALTHCHECK`; see
+  [docs/deploy-digitalocean.md](docs/deploy-digitalocean.md).
 
 ---
 
@@ -51,6 +64,8 @@ prompts ─▶ [ bounded asyncio.Queue ] ─▶ N worker coroutines ─▶ resul
 ---
 
 ## Quickstart
+
+> Requires **Python 3.11+**.
 
 ```bash
 # 1. Create a virtualenv and install deps
@@ -126,6 +141,23 @@ curl http://127.0.0.1:8000/jobs/<job_id>/results | jq
 bash scripts/demo.sh
 ```
 
+### Run with Docker
+
+```bash
+docker build -t batch-inference-engine .
+docker run --rm -p 8080:8080 -e WORKER_POOL_SIZE=32 batch-inference-engine
+# -> http://127.0.0.1:8080/docs   |   /metrics   |   /healthz
+```
+
+### Observability
+
+```bash
+curl http://127.0.0.1:8000/metrics      # Prometheus exposition
+# Logs are structured JSON, one object per line:
+# {"ts":"...","level":"INFO","logger":"batch_engine","msg":"prompt processed",
+#  "job_id":"...","prompt_id":"prompt-1","status":"succeeded","attempts":1,"latency_ms":7.4}
+```
+
 ---
 
 ## API reference
@@ -135,9 +167,14 @@ bash scripts/demo.sh
 | `POST` | `/batches` | Submit a JSON batch `{ "prompts": [{ "id"?, "prompt" }] }`. Returns `202` + `job_id`. |
 | `POST` | `/batches/upload` | Submit a batch as a `.json` file (bare array or `{prompts:[...]}`). |
 | `GET`  | `/jobs/{job_id}` | Real-time progress for a job. |
-| `GET`  | `/jobs/{job_id}/results` | Aggregated results (partial while running). |
+| `GET`  | `/jobs/{job_id}/results?limit=&offset=` | Paginated aggregated results (partial while running). |
+| `POST` | `/jobs/{job_id}/cancel` | Cancel a running job. |
+| `GET`  | `/metrics` | Prometheus metrics (text exposition format). |
 | `GET`  | `/healthz` | Liveness probe. |
 | `GET`  | `/docs` | Swagger UI. |
+
+When the engine is at capacity (`MAX_ACTIVE_JOBS` reached), `POST /batches*`
+returns `503 Service Unavailable` with a `Retry-After` header.
 
 ---
 
@@ -147,13 +184,18 @@ All settings are environment variables (see [`app/config.py`](app/config.py)):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKER_POOL_SIZE` | `16` | Number of concurrent workers (in-flight call cap). |
-| `MAX_QUEUE_SIZE` | `10000` | Bounded queue size (backpressure / memory cap). |
+| `WORKER_POOL_SIZE` | `16` | Workers per job (per-job in-flight cap). |
+| `MAX_QUEUE_SIZE` | `10000` | Bounded queue size (pending-work backpressure). |
+| `GLOBAL_MAX_CONCURRENCY` | `64` | Process-wide cap on concurrent inference across all jobs. |
+| `MAX_ACTIVE_JOBS` | `50` | Active jobs before `/batches` returns `503 + Retry-After`. |
+| `OVERLOAD_RETRY_AFTER_SECONDS` | `5` | `Retry-After` value sent when overloaded. |
+| `GRACEFUL_SHUTDOWN_SECONDS` | `10` | Drain window for in-flight prompts on shutdown. |
 | `MAX_RETRIES` | `5` | Retry attempts per prompt on 429. |
 | `BACKOFF_BASE_SECONDS` | `0.2` | Base for exponential backoff. |
 | `BACKOFF_MAX_SECONDS` | `10.0` | Backoff ceiling. |
 | `BACKOFF_JITTER` | `0.1` | Max added jitter (seconds). |
 | `MOCK_RATE_LIMIT_EVERY` | `7` | Mock endpoint returns 429 every Nth call. |
+| `LOG_LEVEL` | `INFO` | Log level for structured JSON logs. |
 
 Example: `WORKER_POOL_SIZE=32 MAX_RETRIES=8 uvicorn app.main:app`
 
@@ -166,7 +208,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-The suite (17 tests) covers:
+The suite (26 tests) covers:
 
 - **Backoff math** — exponential growth, capping, jitter bounds.
 - **429 retry** — succeeds after N 429s; counts each backoff; honors `Retry-After`;
@@ -174,9 +216,17 @@ The suite (17 tests) covers:
   non-retryable errors.
 - **Engine resilience** — periodic 429s **do not fail the batch**; failures are
   isolated; the immediate-ack/background behavior holds.
-- **Concurrency bound** — peak in-flight calls never exceed `WORKER_POOL_SIZE`.
+- **Correctness fixes** — prompts without ids never collide in results; an
+  unexpected per-prompt exception does **not** hang the job.
+- **Concurrency bound** — peak in-flight calls never exceed `WORKER_POOL_SIZE`,
+  and the **global semaphore** caps concurrency across multiple jobs.
+- **Backpressure** — `submit` raises (→ `503`) past `MAX_ACTIVE_JOBS`; recovers
+  after jobs drain. Cancellation marks jobs `cancelled`.
+- **Metrics** — counters/histograms increment and render as valid Prometheus text.
+- **CI guard** — workflow triggers on the active branch.
 - **Scale** — a 1,000-prompt batch completes successfully.
-- **API** — submit, upload, poll-to-completion, 404s, validation errors.
+- **API** — submit, upload, poll-to-completion, pagination, `/metrics`, 404s,
+  validation errors.
 
 The retry tests inject a fake `sleep` that *records* delays instead of waiting,
 so the back-off logic is verified deterministically and instantly.
@@ -197,24 +247,43 @@ so the back-off logic is verified deterministically and instantly.
 
 ```
 app/
-  config.py          # env-driven settings (pool size, backoff, mock cadence)
-  models.py          # Pydantic request/response models + internal Job record
+  config.py          # env-driven settings (pool size, backoff, limits, mock cadence)
+  models.py          # Pydantic request/response models + internal Job/WorkItem
   mock_inference.py  # mock endpoint that periodically returns HTTP 429
-  engine.py          # bounded worker pool + infer_with_retry (backoff) + job store
-  main.py            # FastAPI endpoints
-tests/               # backoff, engine, and API tests
+  engine.py          # worker pool + global semaphore + infer_with_retry + job store
+  metrics.py         # dependency-free Prometheus registry
+  logging_config.py  # structured JSON logging
+  main.py            # FastAPI endpoints (/batches, /jobs, /metrics, /healthz)
+tests/               # backoff, engine, hardening, and API tests
 scripts/
   generate_prompts.py
   demo.sh
-docs/architecture.md # architecture diagram + design rationale
+docs/
+  architecture.md        # architecture diagram + design rationale
+  deploy-digitalocean.md # App Platform + DOKS deployment guide
+Dockerfile             # non-root, healthcheck, honors $PORT
+.dockerignore
 .github/workflows/ci.yml
 ```
 
 ---
 
+## Tradeoffs (current scope)
+
+Deliberate simplifications, and what production would change:
+
+| Area | Current | Production direction |
+|---|---|---|
+| **Durability** | In-memory job store; jobs/results lost on restart. | Postgres for jobs/results, or Redis for fast shared state. |
+| **Scale-out** | Single process; job store is per-instance. | Shared store (Redis/Postgres) + a real task queue (Celery/RQ/Arq) so any worker/instance can process and any instance can answer status. |
+| **Memory** | Prompt list + results held in RAM; uploads read fully into memory. Bounds *in-flight* work, not total memory. | Streaming/file-backed ingestion; spill results to DB/object storage. |
+| **Inference backend** | Mock client behind the `InferFn` interface. | Swap in a real provider (same interface); add per-provider rate-limit config. |
+| **AuthN/Z** | None. | API keys / OIDC, per-tenant quotas. |
+
 ## Possible next steps
 
-- Persist jobs/results to a database (SQLite/Postgres) for durability across restarts.
-- Replace the mock client with a real provider behind the same `InferFn` interface.
-- Add a per-job cancel endpoint and result pagination/streaming.
-- Move the job store to Redis to scale workers across processes.
+- Persist jobs/results to Postgres (durability across restarts) behind a
+  `JobStore` interface; keep `InMemoryJobStore` for local/dev.
+- Move to a distributed task queue so workers scale horizontally across pods.
+- Add an `HorizontalPodAutoscaler` keyed on `inference_latency_seconds`.
+- Result streaming (NDJSON) for very large batches.
