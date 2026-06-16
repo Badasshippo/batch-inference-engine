@@ -69,6 +69,18 @@ groups:
         for: 5m
         annotations:
           summary: "Instance failing readiness for 5m."
+
+      - alert: CostSpike
+        expr: rate(inference_estimated_cost_usd_total[15m]) * 3600 > 5
+        for: 15m
+        annotations:
+          summary: "Estimated inference spend > $5/hour; check for runaway batches."
+
+      - alert: DeadLetterGrowth
+        expr: rate(batch_prompts_failed_total[15m]) > 0.5
+        for: 15m
+        annotations:
+          summary: "Dead-letter queue growing > 0.5 prompts/s; inspect failures."
 ```
 
 ## Common runbook procedures

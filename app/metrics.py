@@ -109,10 +109,11 @@ class Histogram:
             f"# HELP {self.name} {self.help}",
             f"# TYPE {self.name} histogram",
         ]
-        cumulative = 0
+        # `_counts[i]` is already the cumulative count of observations <= edge
+        # (observe() increments every bucket whose edge >= value), which is
+        # exactly Prometheus `le` semantics -- emit it directly, do NOT re-sum.
         for edge, c in zip(self.buckets, self._counts):
-            cumulative += c
-            lines.append(f'{self.name}_bucket{{le="{edge}"}} {cumulative}')
+            lines.append(f'{self.name}_bucket{{le="{edge}"}} {c}')
         lines.append(f'{self.name}_bucket{{le="+Inf"}} {self._count}')
         lines.append(f"{self.name}_sum {self._sum}")
         lines.append(f"{self.name}_count {self._count}")

@@ -25,6 +25,8 @@ The module is framework-agnostic (no FastAPI imports) so it is unit-testable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import random
 import time
@@ -52,6 +54,19 @@ class OverloadedError(Exception):
     def __init__(self, retry_after: int, message: str = "Service overloaded") -> None:
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class IdempotencyConflictError(Exception):
+    """Raised when an Idempotency-Key is reused with a different payload."""
+
+
+def _fingerprint(prompts: "Sequence[PromptItem]", priority: "Priority") -> str:
+    """Stable hash of a submission, used to detect idempotency-key misuse."""
+    payload = json.dumps(
+        {"p": priority.value, "items": [[p.id, p.prompt] for p in prompts]},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def compute_backoff(attempt: int, settings: Settings, rng: random.Random | None = None) -> float:
@@ -170,20 +185,37 @@ class BatchEngine:
             raise OverloadedError(
                 self.settings.overload_retry_after_seconds, "Service is shutting down"
             )
+        fingerprint = _fingerprint(prompts, priority)
         if idempotency_key:
             existing = self.store.find_by_idempotency_key(idempotency_key)
             if existing is not None:
+                # Same key + same payload -> idempotent reuse. Same key + a
+                # *different* payload is a client bug -> 409 Conflict.
+                if existing.request_fingerprint != fingerprint:
+                    raise IdempotencyConflictError(
+                        f"Idempotency-Key '{idempotency_key}' was already used with a "
+                        "different payload."
+                    )
                 metrics.idempotent_reuse.inc()
                 return existing, True
         if self.active_jobs >= self.settings.max_active_jobs:
             metrics.jobs_rejected.inc()
             raise OverloadedError(self.settings.overload_retry_after_seconds)
+        # Bounded pending-work backpressure: reject if accepting this batch would
+        # blow past the configured queue capacity.
+        if self.scheduler.pending + len(prompts) > self.settings.max_queue_size:
+            metrics.jobs_rejected.inc()
+            raise OverloadedError(
+                self.settings.overload_retry_after_seconds,
+                "Scheduler queue is at capacity",
+            )
 
         metrics.jobs_submitted.inc()
         job = Job(
             total=len(prompts),
             priority=priority,
             idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
             state=JobState.RUNNING,
             started_at=time.time(),
         )

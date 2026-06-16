@@ -122,7 +122,7 @@ async def test_large_batch_completes():
     """A 1,000-prompt batch completes with bounded resources."""
     settings = Settings(
         worker_pool_size=32,
-        max_queue_size=500,
+        max_queue_size=1000,
         max_retries=10,
         backoff_base_seconds=0.001,
         backoff_max_seconds=0.01,

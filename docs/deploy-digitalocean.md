@@ -18,20 +18,22 @@ doctl apps create --spec .do/app.yaml
 
 Example app spec (`.do/app.yaml`):
 
+A ready-to-use spec lives at [`.do/app.yaml`](../.do/app.yaml):
+
 ```yaml
 name: batch-inference-engine
 services:
   - name: api
     github:
       repo: Badasshippo/batch-inference-engine
-      branch: main
+      branch: master
       deploy_on_push: true
     dockerfile_path: Dockerfile
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
     health_check:
-      http_path: /healthz
+      http_path: /readyz   # readiness: 503 while draining or saturated
     envs:
       - key: WORKER_POOL_SIZE
         value: "32"
@@ -103,11 +105,11 @@ spec:
             - { name: GLOBAL_MAX_CONCURRENCY, value: "64" }
             - { name: GRACEFUL_SHUTDOWN_SECONDS, value: "20" }
           readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /readyz, port: 8080 }
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet: { path: /livez, port: 8080 }
             initialDelaySeconds: 5
             periodSeconds: 15
           resources:

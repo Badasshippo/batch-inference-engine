@@ -17,6 +17,14 @@ def test_aimd_multiplicative_decrease_on_throttle():
     assert lim.limit == 2  # floored at minimum
 
 
+def test_limiter_clamps_when_min_exceeds_max():
+    # Misconfiguration: min (4) > max (2). The limiter must not exceed max.
+    lim = AdaptiveConcurrencyLimiter(initial=2, minimum=4, maximum=2)
+    assert lim.limit == 2
+    lim.record_throttle()
+    assert lim.limit <= 2
+
+
 def test_aimd_additive_increase_after_success_streak():
     lim = AdaptiveConcurrencyLimiter(initial=2, minimum=1, maximum=5, increase_after=3)
     for _ in range(2):

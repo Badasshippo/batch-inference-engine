@@ -163,6 +163,27 @@ async def test_metrics_increment_on_processing():
     assert "# TYPE inference_latency_seconds histogram" in text
 
 
+def test_histogram_buckets_are_cumulative_not_double_counted():
+    from app.metrics import Histogram
+
+    h = Histogram("t", "help", buckets=(0.1, 0.5, 1.0))
+    h.observe(0.05)
+    h.observe(0.05)
+    text = "\n".join(h.render())
+    # Two observations <= 0.1: every `le` bucket must read 2 (cumulative), not 4.
+    assert 't_bucket{le="0.1"} 2' in text
+    assert 't_bucket{le="0.5"} 2' in text
+    assert 't_bucket{le="1.0"} 2' in text
+    assert 't_bucket{le="+Inf"} 2' in text
+    assert "t_count 2" in text
+
+    # An observation above all finite buckets only shows in +Inf.
+    h.observe(2.0)
+    text = "\n".join(h.render())
+    assert 't_bucket{le="1.0"} 2' in text
+    assert 't_bucket{le="+Inf"} 3' in text
+
+
 def test_ci_runs_on_active_branch():
     """The CI workflow must trigger on the repo's actual default branch."""
     ci = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"

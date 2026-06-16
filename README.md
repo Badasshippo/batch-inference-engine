@@ -188,13 +188,16 @@ All batch/job routes are available under `/v1` (canonical) and at the root path
 | `POST` | `/v1/jobs/{job_id}/replay-failed` | New job from only the failed prompts. |
 | `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a running job. |
 | `GET`  | `/v1/jobs/{job_id}/events` | Server-Sent Events lifecycle stream. |
+| `GET`  | `/v1/system/capacity` | Live capacity (active jobs, queue depth, in-flight, concurrency limit). |
 | `GET`  | `/metrics` | Prometheus metrics (text exposition format). |
 | `GET`  | `/healthz` · `/livez` · `/readyz` | Health: basic · liveness · readiness. |
 | `GET`  | `/docs` | Swagger UI. |
 
 Headers: send `Idempotency-Key` on submit for safe retries; every response
-carries an `X-Request-ID` (echoed if you provide one). When the engine is at
-capacity (`MAX_ACTIVE_JOBS`), submits return `503` with a `Retry-After` header.
+carries an `X-Request-ID` (echoed if you provide one). Reusing an
+`Idempotency-Key` with a *different* payload returns `409 Conflict`. When the
+engine is at capacity (`MAX_ACTIVE_JOBS` or `MAX_QUEUE_SIZE`), submits return
+`503` with a `Retry-After` header.
 
 **Auth (optional):** set `API_KEY` to require an `X-API-Key` header on all `/v1`
 routes (health and `/metrics` stay open). Unset by default.
@@ -238,7 +241,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-The suite (47 tests) covers:
+The suite (55 tests) covers:
 
 - **Backoff math** — exponential growth, capping, jitter bounds.
 - **429 retry** — succeeds after N 429s; counts each backoff; honors `Retry-After`;
@@ -250,9 +253,12 @@ The suite (47 tests) covers:
   unexpected per-prompt exception does **not** hang the job.
 - **Concurrency bound** — peak in-flight calls never exceed `WORKER_POOL_SIZE`,
   and the **global semaphore** caps concurrency across multiple jobs.
-- **Backpressure** — `submit` raises (→ `503`) past `MAX_ACTIVE_JOBS`; recovers
-  after jobs drain. Cancellation marks jobs `cancelled`.
-- **Metrics** — counters/histograms increment and render as valid Prometheus text.
+- **Backpressure** — `submit` raises (→ `503`) past `MAX_ACTIVE_JOBS` or
+  `MAX_QUEUE_SIZE`; recovers after jobs drain. Cancellation marks jobs `cancelled`.
+- **Metrics** — counters/histograms increment and render as valid Prometheus text;
+  histogram `le` buckets are cumulative (no double-counting).
+- **Idempotency** — same key + same payload reuses the job; **different payload
+  → `409 Conflict`**.
 - **CI guard** — workflow triggers on the active branch.
 - **Scheduler** — round-robin fairness, priority weighting, anti-starvation.
 - **Rate limiting** — AIMD multiplicative decrease / additive increase; limiter

@@ -173,6 +173,7 @@ class Job:
     output_tokens: int = 0
     cost_usd: float = 0.0
     idempotency_key: str | None = None
+    request_fingerprint: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None

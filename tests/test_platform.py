@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.engine import BatchEngine
+from app.engine import BatchEngine, IdempotencyConflictError, OverloadedError
 from app.main import app
 from app.mock_inference import InferenceError
 from app.models import JobState, Priority, PromptItem
@@ -74,6 +74,31 @@ async def test_dead_letter_and_replay():
     await _wait_for(replay)
     # They still fail (deterministic), so the new job also has 2 dead letters.
     assert replay.failed == 2
+
+
+async def test_idempotency_conflict_on_different_payload():
+    async def infer(p: str) -> str:
+        return f"ok::{p}"
+
+    engine = BatchEngine(infer=infer, settings=_settings())
+    await engine.submit_with_idempotency([PromptItem(prompt="a")], idempotency_key="k")
+    # Same key, same payload -> reuse.
+    _, reused = await engine.submit_with_idempotency([PromptItem(prompt="a")], idempotency_key="k")
+    assert reused is True
+    # Same key, different payload -> conflict.
+    with pytest.raises(IdempotencyConflictError):
+        await engine.submit_with_idempotency([PromptItem(prompt="DIFFERENT")], idempotency_key="k")
+
+
+async def test_queue_capacity_is_enforced():
+    async def infer(p: str) -> str:
+        await asyncio.sleep(0.05)
+        return p
+
+    engine = BatchEngine(infer=infer, settings=_settings(max_queue_size=5))
+    # A single batch larger than the queue capacity is rejected.
+    with pytest.raises(OverloadedError):
+        await engine.submit([PromptItem(prompt="x") for _ in range(10)])
 
 
 async def test_replay_with_no_failures_returns_none():
@@ -144,6 +169,21 @@ async def _poll(client, path: str, timeout: float = 15.0) -> dict:
         if asyncio.get_event_loop().time() > deadline:
             raise AssertionError(f"stuck in {body['state']}")
         await asyncio.sleep(0.02)
+
+
+async def test_system_capacity_endpoint(client):
+    body = (await client.get("/v1/system/capacity")).json()
+    for key in ("accepting", "active_jobs", "queue_depth", "inflight", "concurrency_limit"):
+        assert key in body
+    assert body["accepting"] is True
+
+
+async def test_idempotency_conflict_returns_409(client):
+    h = {"Idempotency-Key": "conflict-key"}
+    r1 = await client.post("/v1/batches", json={"prompts": [{"prompt": "a"}]}, headers=h)
+    assert r1.status_code == 202
+    r2 = await client.post("/v1/batches", json={"prompts": [{"prompt": "different"}]}, headers=h)
+    assert r2.status_code == 409
 
 
 async def test_health_model(client):

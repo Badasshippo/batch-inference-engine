@@ -73,9 +73,11 @@ class AdaptiveConcurrencyLimiter:
         decrease_factor: float = 0.5,
         increase_after: int = 10,
     ) -> None:
-        self._limit = max(minimum, initial)
-        self._min = minimum
+        # Clamp so the invariant min <= limit <= max always holds, even if the
+        # operator misconfigures ADAPTIVE_MIN_CONCURRENCY > GLOBAL_MAX_CONCURRENCY.
         self._max = maximum if maximum is not None else initial
+        self._min = min(minimum, self._max)
+        self._limit = max(self._min, min(initial, self._max))
         self._decrease = decrease_factor
         self._increase_after = increase_after
         self._in_use = 0

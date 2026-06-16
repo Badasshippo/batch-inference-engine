@@ -27,7 +27,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import __version__
-from .engine import BatchEngine, OverloadedError
+from .engine import BatchEngine, IdempotencyConflictError, OverloadedError
 from .logging_config import get_logger, request_id_var, setup_logging
 from .metrics import metrics
 from .models import (
@@ -206,6 +206,24 @@ async def list_jobs(
     )
 
 
+@api.get("/system/capacity")
+async def system_capacity(request: Request) -> dict:
+    """Live capacity snapshot for dashboards / autoscaling decisions."""
+    engine = _engine(request)
+    s = engine.settings
+    return {
+        "accepting": engine.accepting,
+        "active_jobs": engine.active_jobs,
+        "max_active_jobs": s.max_active_jobs,
+        "queue_depth": engine.scheduler.pending,
+        "max_queue_size": s.max_queue_size,
+        "inflight": int(metrics.inflight.value),
+        "concurrency_limit": engine._limiter.limit,
+        "global_max_concurrency": s.global_max_concurrency,
+        "saturated": engine.active_jobs >= s.max_active_jobs,
+    }
+
+
 @api.post("/batches", response_model=SubmitResponse, status_code=status.HTTP_202_ACCEPTED)
 async def submit_batch(
     payload: BatchRequest,
@@ -219,6 +237,8 @@ async def submit_batch(
         )
     except OverloadedError as exc:
         raise _overloaded(exc) from exc
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _ack(job, request, reused)
 
 
@@ -261,6 +281,8 @@ async def upload_batch(
         )
     except OverloadedError as exc:
         raise _overloaded(exc) from exc
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _ack(job, request, reused)
 
 
