@@ -97,7 +97,10 @@ def _engine(request: Request) -> BatchEngine:
 
 
 def _ack(job, request: Request, reused: bool) -> SubmitResponse:
-    base = str(request.base_url).rstrip("/")
+    # Respect the scheme set by the upstream proxy (App Platform, nginx, etc.)
+    # so returned URLs use https:// rather than the internal http://.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    base = str(request.base_url).rstrip("/").replace(request.url.scheme, proto, 1)
     return SubmitResponse(
         job_id=job.id,
         state=job.state,
