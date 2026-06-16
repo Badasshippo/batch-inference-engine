@@ -34,10 +34,27 @@ class Settings:
     # backpressure so a huge batch cannot balloon memory usage.
     max_queue_size: int = _get_int("MAX_QUEUE_SIZE", 10_000)
 
-    # Global cap on concurrent inference calls *across all jobs*. Each job runs
-    # its own worker pool, so without this a flood of concurrent batches could
-    # multiply concurrency. This semaphore is the true system-wide limit.
+    # WORKER_POOL_SIZE is the size of the single, *global* worker pool that
+    # drains the fair scheduler (all jobs share it).
+    # GLOBAL_MAX_CONCURRENCY is the upper bound the adaptive limiter may grow to.
     global_max_concurrency: int = _get_int("GLOBAL_MAX_CONCURRENCY", 64)
+
+    # Adaptive (AIMD) concurrency controller bounds + tuning. Defaults are tuned
+    # to settle at a healthy equilibrium under a steady background 429 rate
+    # rather than collapsing to the floor: gentle multiplicative decrease + a
+    # short success streak before additive increase.
+    adaptive_min_concurrency: int = _get_int("ADAPTIVE_MIN_CONCURRENCY", 4)
+    adaptive_increase_after: int = _get_int("ADAPTIVE_INCREASE_AFTER", 5)
+    adaptive_decrease_factor: float = _get_float("ADAPTIVE_DECREASE_FACTOR", 0.8)
+
+    # Token-bucket cap on upstream requests/sec (0 disables proactive limiting).
+    provider_max_rps: float = _get_float("PROVIDER_MAX_RPS", 0.0)
+    provider_burst: float = _get_float("PROVIDER_BURST", 0.0)
+
+    # Cost accounting (USD per 1K tokens) and a rough token estimator.
+    cost_per_1k_input_tokens: float = _get_float("COST_PER_1K_INPUT_TOKENS", 0.00015)
+    cost_per_1k_output_tokens: float = _get_float("COST_PER_1K_OUTPUT_TOKENS", 0.0006)
+    chars_per_token: float = _get_float("CHARS_PER_TOKEN", 4.0)
 
     # API-level backpressure: refuse new batches (HTTP 503 + Retry-After) once
     # this many jobs are actively running, so the service degrades gracefully

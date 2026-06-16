@@ -1,65 +1,77 @@
 # Batch Inference Engine
 
-A backend REST service that ingests a batch of AI prompts, processes them
-**concurrently** against a mock rate-limited inference endpoint, transparently
-handles **HTTP 429** with retry/backoff, and **aggregates** the results — while
-exposing a **real-time job-status API**.
+A production-shaped **batch inference platform**: ingest a batch of AI prompts,
+process them **concurrently** against a rate-limited inference provider, **fairly
+schedule** across many jobs, handle **HTTP 429** with both *proactive* rate
+limiting and *reactive* retry/backoff, and **aggregate** results — with full
+observability, idempotent submits, cost accounting, dead-letter recovery, and a
+clean cloud deployment path.
 
-Built with **FastAPI + asyncio**. Submitting a batch returns immediately; the
-work runs in the background on a **bounded worker pool**.
+Built with **FastAPI + asyncio**. Submitting a batch returns immediately; work
+runs in the background on a single **global, fair, bounded worker pool**.
 
 ---
 
 ## Features
 
+Core (assignment requirements):
+
 - **Batch ingestion** — submit a JSON array of prompts (1,000+ items) via request
   body or file upload; get an immediate `202 Accepted` acknowledgment.
-- **Concurrent processing** — a bounded pool of `N` async workers drains a shared
-  queue, instead of running prompts sequentially.
-- **Rate-limit handling** — workers retry `429 Too Many Requests` with exponential
+- **Concurrent processing** — one global worker pool drains a shared scheduler in
+  parallel, instead of running prompts sequentially.
+- **Rate-limit handling** — retries `429 Too Many Requests` with exponential
   backoff + jitter (honoring `Retry-After`), so prompts are never dropped.
-- **Bounded concurrency** — fixed worker pool, a bounded queue, **and** a global
-  semaphore cap in-flight inference across all jobs (no unbounded task spawning).
-- **Result aggregation** — successful completions are compiled into a paginated
-  JSON result set, queryable per job.
-- **Job status API** — poll live progress (e.g. `400/1000 completed`, retries,
-  duration).
+- **Bounded concurrency** — worker pool + bounded scheduler + an adaptive global
+  limiter cap in-flight inference across all jobs (no unbounded task spawning).
+- **Result aggregation** — completions compiled into a paginated JSON result set.
+- **Job status API** — poll live progress (`400/1000 completed`, retries, cost).
 
-Operational maturity (cloud-ready):
+Platform / cloud-engineering features:
 
-- **API backpressure** — returns `503 + Retry-After` once `MAX_ACTIVE_JOBS` are
-  running, instead of collapsing under load.
-- **Observability** — Prometheus `/metrics` (counters + latency/duration
-  histograms) and structured JSON logs (`job_id`, `prompt_id`, `attempt`,
-  `status`, `latency_ms`).
-- **Graceful shutdown** — drains in-flight prompts before exit (rolling-deploy
-  friendly).
-- **Job cancellation** — `POST /jobs/{id}/cancel`.
-- **Container-ready** — non-root `Dockerfile` with a `HEALTHCHECK`; see
-  [docs/deploy-digitalocean.md](docs/deploy-digitalocean.md).
+- **Fair multi-tenant scheduler** — weighted round-robin (priority high/normal/low)
+  so a 10k-prompt batch can't starve small jobs; nothing is starved.
+- **Adaptive rate limiting** — token-bucket global RPS cap + **AIMD** controller
+  that shrinks concurrency on 429s and grows it back on success (prevents
+  stampedes *before* they happen).
+- **Idempotent submits** — `Idempotency-Key` header returns the original job.
+- **API backpressure** — `503 + Retry-After` once `MAX_ACTIVE_JOBS` are running.
+- **Dead-letter queue + replay** — inspect failed prompts; re-run only those.
+- **Cost & token accounting** — per-job and cumulative estimated cost.
+- **Observability** — Prometheus `/metrics` (counters/gauges/histograms),
+  structured JSON logs with `request_id`/`job_id`/`prompt_id`/`latency_ms`/`cost`.
+- **Health model** — `/livez` (alive) + `/readyz` (accepting & not saturated).
+- **Graceful shutdown** — drains in-flight prompts, then marks unfinished cancelled.
+- **SSE events** — `GET /v1/jobs/{id}/events` streams lifecycle events.
+- **Versioned API** (`/v1`) + **non-root Dockerfile** with `HEALTHCHECK`.
 
 ---
 
 ## Architecture
 
-See **[docs/architecture.md](docs/architecture.md)** for the full diagram and
-rationale. In short:
+See **[docs/architecture.md](docs/architecture.md)** for the full diagram, and
+**[docs/architecture-decisions.md](docs/architecture-decisions.md)** for the ADRs.
+In short:
 
 ```
-prompts ─▶ [ bounded asyncio.Queue ] ─▶ N worker coroutines ─▶ results
-                                              │
-                                              ▼
-                                   infer_with_retry()  ──(429)──▶ backoff + retry
-                                              │
-                                              ▼
-                                    in-memory job store (live progress)
+submit ─▶ [ FairScheduler: weighted round-robin per job ] ─▶ global worker pool
+                                                                   │
+                          token bucket (RPS) + AIMD limiter ───────┤
+                                                                   ▼
+                          infer_with_retry ──(429)──▶ backoff   provider
+                                                                   │
+                                  results / dead-letter ──▶ JobStore (live progress)
 ```
 
-- **Producer** enqueues prompts into a bounded queue (backpressure).
-- **Worker pool** (`WORKER_POOL_SIZE` coroutines) is the hard cap on in-flight calls.
-- **`infer_with_retry`** backs off on 429s; exhausted/non-retryable items are marked
-  failed without crashing the batch.
-- Single event loop ⇒ shared counters need no locks.
+- **Scheduler** fairly interleaves jobs by priority; **one** global pool drains it.
+- **Proactive** (token bucket + AIMD) + **reactive** (retry/backoff) rate control.
+- Per-prompt failures are isolated to a **dead-letter queue**; the batch continues.
+- Single event loop ⇒ shared counters need no locks. `JobStore` seam keeps the
+  store swappable (Postgres/Redis in prod).
+
+**Docs:** [architecture](docs/architecture.md) ·
+[ADRs](docs/architecture-decisions.md) · [operations / alerts](docs/operations.md) ·
+[SLOs](docs/slo.md) · [DigitalOcean deploy](docs/deploy-digitalocean.md)
 
 ---
 
@@ -162,19 +174,26 @@ curl http://127.0.0.1:8000/metrics      # Prometheus exposition
 
 ## API reference
 
+All batch/job routes are available under `/v1` (canonical) and at the root path
+(back-compat).
+
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/batches` | Submit a JSON batch `{ "prompts": [{ "id"?, "prompt" }] }`. Returns `202` + `job_id`. |
-| `POST` | `/batches/upload` | Submit a batch as a `.json` file (bare array or `{prompts:[...]}`). |
-| `GET`  | `/jobs/{job_id}` | Real-time progress for a job. |
-| `GET`  | `/jobs/{job_id}/results?limit=&offset=` | Paginated aggregated results (partial while running). |
-| `POST` | `/jobs/{job_id}/cancel` | Cancel a running job. |
+| `POST` | `/v1/batches` | Submit a JSON batch `{ "prompts": [...], "priority": "high\|normal\|low" }`. Honors `Idempotency-Key`. Returns `202` + `job_id`. |
+| `POST` | `/v1/batches/upload?priority=` | Submit a batch as a `.json` file (bare array or `{prompts:[...]}`). |
+| `GET`  | `/v1/jobs/{job_id}` | Real-time progress (state, progress, pending, retries, cost). |
+| `GET`  | `/v1/jobs/{job_id}/results?limit=&offset=` | Paginated aggregated results. |
+| `GET`  | `/v1/jobs/{job_id}/dead-letter?limit=&offset=` | Failed prompts (dead-letter queue). |
+| `POST` | `/v1/jobs/{job_id}/replay-failed` | New job from only the failed prompts. |
+| `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a running job. |
+| `GET`  | `/v1/jobs/{job_id}/events` | Server-Sent Events lifecycle stream. |
 | `GET`  | `/metrics` | Prometheus metrics (text exposition format). |
-| `GET`  | `/healthz` | Liveness probe. |
+| `GET`  | `/healthz` · `/livez` · `/readyz` | Health: basic · liveness · readiness. |
 | `GET`  | `/docs` | Swagger UI. |
 
-When the engine is at capacity (`MAX_ACTIVE_JOBS` reached), `POST /batches*`
-returns `503 Service Unavailable` with a `Retry-After` header.
+Headers: send `Idempotency-Key` on submit for safe retries; every response
+carries an `X-Request-ID` (echoed if you provide one). When the engine is at
+capacity (`MAX_ACTIVE_JOBS`), submits return `503` with a `Retry-After` header.
 
 ---
 
@@ -186,8 +205,14 @@ All settings are environment variables (see [`app/config.py`](app/config.py)):
 |---|---|---|
 | `WORKER_POOL_SIZE` | `16` | Workers per job (per-job in-flight cap). |
 | `MAX_QUEUE_SIZE` | `10000` | Bounded queue size (pending-work backpressure). |
-| `GLOBAL_MAX_CONCURRENCY` | `64` | Process-wide cap on concurrent inference across all jobs. |
-| `MAX_ACTIVE_JOBS` | `50` | Active jobs before `/batches` returns `503 + Retry-After`. |
+| `GLOBAL_MAX_CONCURRENCY` | `64` | Upper bound the adaptive limiter may grow to. |
+| `ADAPTIVE_MIN_CONCURRENCY` | `4` | Floor for the AIMD limiter. |
+| `ADAPTIVE_INCREASE_AFTER` | `5` | Success streak before additive +1. |
+| `ADAPTIVE_DECREASE_FACTOR` | `0.8` | Multiplier applied to the limit on each 429. |
+| `PROVIDER_MAX_RPS` | `0` | Token-bucket RPS cap (0 disables proactive limiting). |
+| `COST_PER_1K_INPUT_TOKENS` | `0.00015` | Cost estimate, USD per 1K input tokens. |
+| `COST_PER_1K_OUTPUT_TOKENS` | `0.0006` | Cost estimate, USD per 1K output tokens. |
+| `MAX_ACTIVE_JOBS` | `50` | Active jobs before submit returns `503 + Retry-After`. |
 | `OVERLOAD_RETRY_AFTER_SECONDS` | `5` | `Retry-After` value sent when overloaded. |
 | `GRACEFUL_SHUTDOWN_SECONDS` | `10` | Drain window for in-flight prompts on shutdown. |
 | `MAX_RETRIES` | `5` | Retry attempts per prompt on 429. |
@@ -208,7 +233,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-The suite (26 tests) covers:
+The suite (47 tests) covers:
 
 - **Backoff math** — exponential growth, capping, jitter bounds.
 - **429 retry** — succeeds after N 429s; counts each backoff; honors `Retry-After`;
@@ -224,9 +249,14 @@ The suite (26 tests) covers:
   after jobs drain. Cancellation marks jobs `cancelled`.
 - **Metrics** — counters/histograms increment and render as valid Prometheus text.
 - **CI guard** — workflow triggers on the active branch.
+- **Scheduler** — round-robin fairness, priority weighting, anti-starvation.
+- **Rate limiting** — AIMD multiplicative decrease / additive increase; limiter
+  blocks beyond its limit; token bucket enforces RPS.
+- **Platform** — idempotency, dead-letter + replay, cost accounting, provider
+  abstraction, adaptive shrink under throttle.
+- **API** — `/v1` prefix, priority, `X-Request-ID`, health model, SSE stream,
+  pagination, `/metrics`, 404s, validation errors.
 - **Scale** — a 1,000-prompt batch completes successfully.
-- **API** — submit, upload, poll-to-completion, pagination, `/metrics`, 404s,
-  validation errors.
 
 The retry tests inject a fake `sleep` that *records* delays instead of waiting,
 so the back-off logic is verified deterministically and instantly.
@@ -247,20 +277,27 @@ so the back-off logic is verified deterministically and instantly.
 
 ```
 app/
-  config.py          # env-driven settings (pool size, backoff, limits, mock cadence)
-  models.py          # Pydantic request/response models + internal Job/WorkItem
+  config.py          # env-driven settings (pools, backoff, AIMD, RPS, cost, limits)
+  models.py          # Pydantic models + internal Job/WorkItem + Priority
   mock_inference.py  # mock endpoint that periodically returns HTTP 429
-  engine.py          # worker pool + global semaphore + infer_with_retry + job store
-  metrics.py         # dependency-free Prometheus registry
-  logging_config.py  # structured JSON logging
-  main.py            # FastAPI endpoints (/batches, /jobs, /metrics, /healthz)
-tests/               # backoff, engine, hardening, and API tests
+  providers.py       # InferenceProvider protocol + Mock/Slow/Flaky providers
+  scheduler.py       # global fair scheduler (weighted round-robin)
+  ratelimit.py       # token bucket + AIMD adaptive concurrency limiter
+  store.py           # JobStore protocol + InMemoryJobStore
+  engine.py          # global worker pool + scheduler + limiters + cost + dead-letter
+  metrics.py         # dependency-free Prometheus registry (counters/gauges/histos)
+  logging_config.py  # structured JSON logging + request-id contextvar
+  main.py            # FastAPI: /v1 router, health model, SSE, middleware
+tests/               # backoff, engine, hardening, scheduler, ratelimit, platform, API
 scripts/
   generate_prompts.py
   demo.sh
 docs/
-  architecture.md        # architecture diagram + design rationale
-  deploy-digitalocean.md # App Platform + DOKS deployment guide
+  architecture.md            # diagram + design rationale
+  architecture-decisions.md  # ADRs (the "why")
+  operations.md              # runbook + Prometheus alert rules
+  slo.md                     # SLOs + error budget
+  deploy-digitalocean.md     # App Platform + DOKS deployment guide
 Dockerfile             # non-root, healthcheck, honors $PORT
 .dockerignore
 .github/workflows/ci.yml

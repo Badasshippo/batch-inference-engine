@@ -1,29 +1,29 @@
-"""FastAPI surface for the batch inference engine.
+"""FastAPI surface for the batch inference platform.
 
-Endpoints
----------
-POST /batches            Submit a JSON batch of prompts (immediate ack).
-POST /batches/upload     Submit a batch by uploading a .json file (immediate ack).
-GET  /jobs/{id}          Real-time progress for a job (e.g. 400/1000 completed).
-GET  /jobs/{id}/results  Aggregated results once (or while) processing.
-GET  /healthz            Liveness probe.
+Endpoints are mounted under both ``/v1`` (canonical, versioned) and the root
+path (back-compat). Health is split into liveness vs readiness so orchestrators
+(Kubernetes / App Platform) can route traffic correctly.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import APIRouter, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import __version__
 from .engine import BatchEngine, OverloadedError
-from .logging_config import get_logger, setup_logging
+from .logging_config import get_logger, request_id_var, setup_logging
 from .metrics import metrics
 from .models import (
     BatchRequest,
+    DeadLetterResponse,
     JobResultsResponse,
     JobStatusResponse,
+    Priority,
     PromptItem,
     SubmitResponse,
 )
@@ -47,31 +47,50 @@ app = FastAPI(
     title="Batch Inference Engine",
     version=__version__,
     description=(
-        "Reads a batch of AI prompts, processes them concurrently against a "
-        "mock rate-limited inference endpoint, and aggregates the results."
+        "Concurrent, rate-limit-aware batch inference platform: fair global "
+        "scheduling, adaptive concurrency, retries/backoff, idempotent submits, "
+        "cost accounting, and full observability."
     ),
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Attach an X-Request-ID to every request for log correlation."""
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    token = request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = rid
+    return response
 
 
 def _engine(request: Request) -> BatchEngine:
     return request.app.state.engine
 
 
-def _ack(job, request: Request) -> SubmitResponse:
+def _ack(job, request: Request, reused: bool) -> SubmitResponse:
     base = str(request.base_url).rstrip("/")
     return SubmitResponse(
         job_id=job.id,
         state=job.state,
         total=job.total,
-        message="Batch accepted. Processing in the background.",
-        status_url=f"{base}/jobs/{job.id}",
-        results_url=f"{base}/jobs/{job.id}/results",
+        priority=job.priority,
+        idempotent_reuse=reused,
+        message=(
+            "Existing job returned (idempotent)."
+            if reused
+            else "Batch accepted. Processing in the background."
+        ),
+        status_url=f"{base}/v1/jobs/{job.id}",
+        results_url=f"{base}/v1/jobs/{job.id}/results",
     )
 
 
 def _overloaded(exc: OverloadedError) -> HTTPException:
-    """Translate an OverloadedError into a 503 with a Retry-After header."""
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=str(exc),
@@ -79,51 +98,81 @@ def _overloaded(exc: OverloadedError) -> HTTPException:
     )
 
 
+def _status(job, engine) -> JobStatusResponse:
+    return JobStatusResponse(**job.snapshot(engine.job_pending(job.id)))
+
+
+# --------------------------------------------------------------------------- #
+# Health & metrics (root only)
+# --------------------------------------------------------------------------- #
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
 
 
+@app.get("/livez")
+async def livez() -> dict[str, str]:
+    """Liveness: the process is up. Always 200 unless the process is dead."""
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+async def readyz(request: Request):
+    """Readiness: can we accept new work right now?"""
+    engine = _engine(request)
+    saturated = engine.active_jobs >= engine.settings.max_active_jobs
+    ready = engine.accepting and not saturated
+    body = {
+        "status": "ready" if ready else "not_ready",
+        "accepting": engine.accepting,
+        "active_jobs": engine.active_jobs,
+        "max_active_jobs": engine.settings.max_active_jobs,
+        "saturated": saturated,
+    }
+    code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
+    return JSONResponse(status_code=code, content=body)
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 async def prometheus_metrics() -> str:
-    """Prometheus exposition endpoint (text format v0.0.4)."""
     return metrics.render()
 
 
 @app.get("/")
 async def root() -> dict[str, str]:
-    return {
-        "service": "batch-inference-engine",
-        "version": __version__,
-        "docs": "/docs",
-    }
+    return {"service": "batch-inference-engine", "version": __version__, "docs": "/docs"}
 
 
-@app.post(
-    "/batches",
-    response_model=SubmitResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def submit_batch(payload: BatchRequest, request: Request) -> SubmitResponse:
-    """Accept a JSON array of prompts and start background processing."""
+# --------------------------------------------------------------------------- #
+# Versioned API router
+# --------------------------------------------------------------------------- #
+api = APIRouter(tags=["batches"])
+
+
+@api.post("/batches", response_model=SubmitResponse, status_code=status.HTTP_202_ACCEPTED)
+async def submit_batch(
+    payload: BatchRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> SubmitResponse:
+    """Submit a JSON array of prompts and start background processing."""
     try:
-        job = await _engine(request).submit(payload.prompts)
+        job, reused = await _engine(request).submit_with_idempotency(
+            payload.prompts, priority=payload.priority, idempotency_key=idempotency_key
+        )
     except OverloadedError as exc:
         raise _overloaded(exc) from exc
-    return _ack(job, request)
+    return _ack(job, request, reused)
 
 
-@app.post(
-    "/batches/upload",
-    response_model=SubmitResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def upload_batch(request: Request, file: UploadFile = File(...)) -> SubmitResponse:
-    """Accept a batch via uploaded JSON file.
-
-    The file may contain either a bare array of prompts or an object with a
-    top-level `prompts` key. Each prompt may be a string or {id?, prompt}.
-    """
+@api.post("/batches/upload", response_model=SubmitResponse, status_code=status.HTTP_202_ACCEPTED)
+async def upload_batch(
+    request: Request,
+    file: UploadFile = File(...),
+    priority: Priority = Query(default=Priority.NORMAL),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> SubmitResponse:
+    """Submit a batch via uploaded JSON file (bare array or {prompts:[...]})."""
     raw = await file.read()
     try:
         data = json.loads(raw)
@@ -150,33 +199,30 @@ async def upload_batch(request: Request, file: UploadFile = File(...)) -> Submit
             )
 
     try:
-        job = await _engine(request).submit(prompts)
+        job, reused = await _engine(request).submit_with_idempotency(
+            prompts, priority=priority, idempotency_key=idempotency_key
+        )
     except OverloadedError as exc:
         raise _overloaded(exc) from exc
-    return _ack(job, request)
+    return _ack(job, request, reused)
 
 
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+@api.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def job_status(job_id: str, request: Request) -> JobStatusResponse:
-    """Return live progress for a batch job."""
-    job = _engine(request).get_job(job_id)
+    engine = _engine(request)
+    job = engine.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
-    return JobStatusResponse(**job.snapshot())
+    return _status(job, engine)
 
 
-@app.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
+@api.get("/jobs/{job_id}/results", response_model=JobResultsResponse)
 async def job_results(
     job_id: str,
     request: Request,
-    limit: int = Query(100, ge=1, le=1000, description="Max results to return."),
-    offset: int = Query(0, ge=0, description="Number of results to skip."),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ) -> JobResultsResponse:
-    """Return the aggregated results for a job (partial if still running).
-
-    Results are paginated; a 1,000-prompt job should not return everything in a
-    single response by default.
-    """
     job = _engine(request).get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
@@ -195,19 +241,87 @@ async def job_results(
     )
 
 
-@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
+@api.get("/jobs/{job_id}/dead-letter", response_model=DeadLetterResponse)
+async def job_dead_letter(
+    job_id: str,
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> DeadLetterResponse:
+    """Inspect prompts that failed after exhausting retries."""
+    job = _engine(request).get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    failed = job.dead_letter()
+    page = failed[offset : offset + limit]
+    return DeadLetterResponse(
+        job_id=job.id, failed=len(failed), returned=len(page), items=page
+    )
+
+
+@api.post("/jobs/{job_id}/replay-failed", response_model=SubmitResponse, status_code=202)
+async def replay_failed(job_id: str, request: Request) -> SubmitResponse:
+    """Create a new job from only the failed prompts of an existing job."""
+    engine = _engine(request)
+    if engine.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+    try:
+        new_job = await engine.replay_failed(job_id)
+    except OverloadedError as exc:
+        raise _overloaded(exc) from exc
+    if new_job is None:
+        raise HTTPException(status_code=409, detail="No failed prompts to replay.")
+    return _ack(new_job, request, False)
+
+
+@api.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse)
 async def cancel_job(job_id: str, request: Request) -> JobStatusResponse:
-    """Request cancellation of a running job."""
     engine = _engine(request)
     outcome = await engine.cancel(job_id)
     if outcome is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
     if outcome is False:
         raise HTTPException(status_code=409, detail="Job has already finished.")
-    job = engine.get_job(job_id)
-    return JobStatusResponse(**job.snapshot())
+    return _status(engine.get_job(job_id), engine)
 
 
-@app.exception_handler(Exception)
-async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+@api.get("/jobs/{job_id}/events")
+async def job_events(job_id: str, request: Request) -> StreamingResponse:
+    """Server-Sent Events stream of a job's lifecycle (progress + terminal)."""
+    engine = _engine(request)
+    if engine.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+
+    async def stream():
+        def sse(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        yield sse("job_started", engine.get_job(job_id).snapshot(engine.job_pending(job_id)))
+        last = -1
+        terminal = {"completed", "failed", "cancelled"}
+        while True:
+            if await request.is_disconnected():
+                return
+            job = engine.get_job(job_id)
+            snap = job.snapshot(engine.job_pending(job_id))
+            if job.completed != last:
+                yield sse("progress", snap)
+                last = job.completed
+            if job.state.value in terminal:
+                yield sse(f"job_{job.state.value}", snap)
+                return
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# Mount under /v1 (canonical) and at root (back-compat).
+app.include_router(api, prefix="/v1")
+app.include_router(api)
+
+
+@app.exception_handler(OverloadedError)
+async def _overloaded_handler(request: Request, exc: OverloadedError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503, content={"detail": str(exc)}, headers={"Retry-After": str(exc.retry_after)}
+    )

@@ -40,6 +40,39 @@ class Counter:
         ]
 
 
+class Gauge:
+    """A value that can go up or down (queue depth, current concurrency, ...)."""
+
+    def __init__(self, name: str, help: str) -> None:
+        self.name = name
+        self.help = help
+        self._value = 0.0
+        self._lock = threading.Lock()
+
+    def set(self, value: float) -> None:
+        with self._lock:
+            self._value = value
+
+    def inc(self, amount: float = 1.0) -> None:
+        with self._lock:
+            self._value += amount
+
+    def dec(self, amount: float = 1.0) -> None:
+        with self._lock:
+            self._value -= amount
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    def render(self) -> list[str]:
+        return [
+            f"# HELP {self.name} {self.help}",
+            f"# TYPE {self.name} gauge",
+            f"{self.name} {self._value}",
+        ]
+
+
 # Default histogram buckets (seconds), tuned for sub-second inference latencies.
 DEFAULT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 
@@ -117,6 +150,27 @@ class Metrics:
         self.inference_rate_limited = Counter(
             "inference_rate_limited_total", "Total HTTP 429 responses observed."
         )
+        self.retries_exhausted = Counter(
+            "inference_retries_exhausted_total", "Prompts that exhausted their retry budget."
+        )
+        self.idempotent_reuse = Counter(
+            "batch_idempotent_reuse_total", "Submits short-circuited by an Idempotency-Key."
+        )
+        self.cost_usd = Counter(
+            "inference_estimated_cost_usd_total", "Cumulative estimated inference cost (USD)."
+        )
+        self.tokens = Counter(
+            "inference_tokens_total", "Cumulative estimated tokens (input+output)."
+        )
+        # Gauges: live system state.
+        self.queue_depth = Gauge(
+            "scheduler_queue_depth", "Pending prompts across all jobs in the scheduler."
+        )
+        self.active_jobs = Gauge("scheduler_active_jobs", "Jobs currently in the scheduler.")
+        self.inflight = Gauge("inference_inflight", "Inference calls currently in flight.")
+        self.concurrency_limit = Gauge(
+            "inference_concurrency_limit", "Current adaptive concurrency limit."
+        )
         self.inference_latency = Histogram(
             "inference_latency_seconds", "End-to-end latency per prompt (incl. retries)."
         )
@@ -133,7 +187,7 @@ class Metrics:
     def render(self) -> str:
         blocks: list[str] = []
         for attr in vars(self).values():
-            if isinstance(attr, (Counter, Histogram)):
+            if isinstance(attr, (Counter, Gauge, Histogram)):
                 blocks.append("\n".join(attr.render()))
         return "\n".join(blocks) + "\n"
 

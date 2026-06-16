@@ -5,93 +5,90 @@
 ```mermaid
 flowchart TD
     subgraph Client
-        C1["POST /batches&nbsp;&nbsp;(JSON array)"]
-        C2["POST /batches/upload&nbsp;&nbsp;(.json file)"]
-        C3["GET /jobs/{id}&nbsp;&nbsp;(progress)"]
-        C4["GET /jobs/{id}/results"]
+        C1["POST /v1/batches&nbsp;(+ Idempotency-Key, priority)"]
+        C2["POST /v1/batches/upload"]
+        C3["GET /v1/jobs/{id}&nbsp;(progress)"]
+        C4["GET /v1/jobs/{id}/results&nbsp;(paginated)"]
+        C5["GET /v1/jobs/{id}/events&nbsp;(SSE)"]
+        C6["POST /v1/jobs/{id}/cancel | replay-failed"]
     end
 
-    subgraph API["FastAPI app (app/main.py)"]
-        H["Validate payload<br/>(Pydantic models)"]
-        ACK["Create Job + return 202 ACK<br/>immediately"]
-        STAT["Read live counters<br/>from Job store"]
+    subgraph API["FastAPI (X-Request-ID middleware)"]
+        H["Validate + idempotency check"]
+        ACK["202 ACK immediately"]
+        BP{"accepting & not saturated?"}
+        STAT["status / results / dead-letter / SSE"]
     end
 
-    subgraph Engine["BatchEngine (app/engine.py)"]
-        Q[["Bounded asyncio.Queue<br/>(backpressure)"]]
-        P["Producer<br/>enqueues prompts"]
-        subgraph Pool["Bounded worker pool (N coroutines)"]
+    subgraph Engine["BatchEngine"]
+        SCHED[["FairScheduler<br/>weighted round-robin<br/>(priority + anti-starvation)"]]
+        subgraph Pool["Single global worker pool"]
             W1["worker 1"]
             W2["worker 2"]
             WN["worker N"]
         end
-        AGG["Aggregate results<br/>+ update counters"]
-        STORE[("In-memory Job store<br/>state / progress / results")]
+        AIMD{{"AIMD limiter<br/>(shrinks on 429,<br/>grows on success)"}}
+        TB{{"Token bucket<br/>(global RPS cap)"}}
+        RETRY["infer_with_retry<br/>(backoff + jitter)"]
+        STORE[("JobStore<br/>progress / results / dead-letter / cost")]
     end
 
-    subgraph Retry["infer_with_retry()"]
-        R{"429?"}
-        BO["backoff = min(base*2^n, max) + jitter<br/>(honors Retry-After)"]
-        OK["return output"]
-        FAIL["exhaust retries -> mark item failed<br/>(batch keeps going)"]
-    end
+    PROV["InferenceProvider<br/>(Mock / real, periodic 429)"]
 
-    MOCK["MockInferenceClient<br/>periodic HTTP 429"]
-
-    C1 --> H
+    C1 --> H --> BP
     C2 --> H
-    H --> ACK
-    ACK -->|"background task"| P
-    P --> Q
-    Q --> W1 & W2 & WN
-    W1 & W2 & WN --> R
-    R -->|yes| BO --> R
-    R -->|no| OK
-    R -.->|budget exhausted| FAIL
-    BO -.-> MOCK
-    OK -.-> MOCK
-    W1 & W2 & WN --> AGG --> STORE
+    BP -->|no| R503["503 + Retry-After"]
+    BP -->|yes| ACK
+    ACK -->|enqueue| SCHED
+    SCHED --> W1 & W2 & WN
+    W1 & W2 & WN --> AIMD --> TB --> RETRY --> PROV
+    RETRY -->|429| AIMD
+    W1 & W2 & WN --> STORE
     C3 --> STAT --> STORE
     C4 --> STORE
+    C5 --> STORE
+    C6 --> STORE
 ```
 
 ## Why this design
 
 | Requirement | How it is met |
 |---|---|
-| **Immediate acknowledgment** | `submit()` registers the `Job` and schedules an `asyncio` background task, then returns `202 Accepted` with `job_id` + status URLs. The request never blocks on processing. |
-| **Concurrent processing** | A fixed set of `WORKER_POOL_SIZE` worker coroutines drain a shared queue, so prompts are processed in parallel instead of sequentially. |
-| **Bounded concurrency** | Concurrency is capped three ways: a fixed worker pool per job, a `maxsize`-bounded queue (pending work), and a process-wide semaphore (`GLOBAL_MAX_CONCURRENCY`) limiting in-flight inference across *all* jobs. This bounds in-flight work; see the note below on memory. |
-| **API backpressure** | `submit` rejects new batches with `503 + Retry-After` once `MAX_ACTIVE_JOBS` are running, so the service degrades gracefully instead of collapsing under load. |
-| **Observability** | Structured JSON logs (`job_id`, `prompt_id`, `attempt`, `status`, `latency_ms`) and a Prometheus `/metrics` endpoint (counters + latency/duration histograms). |
-| **Graceful shutdown** | On shutdown the engine stops accepting jobs, lets in-flight prompts drain for `GRACEFUL_SHUTDOWN_SECONDS`, then cancels cleanly — ideal for rolling deploys. |
-| **Rate-limit handling** | `infer_with_retry()` catches `RateLimitError` (429) and sleeps using exponential backoff + jitter, honoring a `Retry-After` hint, up to `MAX_RETRIES`. Prompts are never dropped on a transient 429. |
-| **Resilience** | A prompt that exhausts retries (or hits a non-retryable 500) is recorded as a failed item; the worker and the rest of the batch continue. |
-| **Result aggregation** | Each worker writes its `InferenceResult` into the job's result map and increments counters; `/jobs/{id}/results` returns the compiled JSON. |
-| **Job status API** | Workers update `completed/succeeded/failed/retries` atomically (single-threaded event loop), so `/jobs/{id}` reports real-time progress like `400/1000`. |
+| **Immediate acknowledgment** | `submit` enqueues into the scheduler and returns `202` with `job_id` + status URLs; never blocks on processing. |
+| **Concurrent processing** | A single global worker pool drains the scheduler in parallel. |
+| **Fair multi-tenancy** | `FairScheduler` uses weighted round-robin (priority high/normal/low) so one huge batch can't monopolize workers and small jobs finish fast; every job has weight ≥ 1 so nothing starves. |
+| **Bounded concurrency** | Capped by the worker pool size, the bounded scheduler, **and** an AIMD limiter (≤ `GLOBAL_MAX_CONCURRENCY`) across all jobs. Bounds in-flight work (see memory note). |
+| **Proactive rate limiting** | Token bucket enforces a global RPS ceiling; AIMD shrinks concurrency on 429s and grows it back on success — preventing stampedes before they happen. |
+| **Rate-limit recovery** | `infer_with_retry` retries 429s with exponential backoff + jitter, honoring `Retry-After`. |
+| **Resilience** | Any per-prompt failure (exhausted retries, non-retryable, unexpected) is isolated to the dead-letter queue; the worker and batch continue. |
+| **API backpressure** | `503 + Retry-After` once `MAX_ACTIVE_JOBS` are running. |
+| **Idempotency** | `Idempotency-Key` returns the original job instead of duplicating work. |
+| **Observability** | `/metrics` (counters/gauges/histograms), structured JSON logs with `request_id`/`job_id`/`prompt_id`, cost accounting. |
+| **Health model** | `/livez` (alive), `/readyz` (accepting & not saturated) for clean rolling deploys. |
+| **Graceful shutdown** | Stop accepting → drain in-flight for `GRACEFUL_SHUTDOWN_SECONDS` → cancel rest → mark unfinished jobs cancelled. |
+| **Recoverability** | Dead-letter inspection + `replay-failed` to re-run only failed prompts. |
 
 ## Concurrency model details
 
-The engine uses a **producer / bounded-queue / worker-pool** pattern on a single
-asyncio event loop:
+Everything runs on one asyncio event loop:
 
-1. **Producer** iterates the batch and `await queue.put(item)`. Because the queue
-   is bounded, `put` suspends when full — this is backpressure that bounds the
-   amount of *in-flight* work.
+1. **Scheduler** holds per-job queues and serves them by weighted round-robin
+   with deficit credits (priority weights 4/2/1). `pop()` is synchronous and
+   non-blocking.
+2. **Global worker pool** (`WORKER_POOL_SIZE` coroutines) loops: acquire an AIMD
+   permit → `pop()` an item → token-bucket gate → `infer_with_retry` → record
+   result. Workers exit when the scheduler drains, so there are no idle tasks
+   between batches; the next submit respawns them.
+3. **AIMD limiter** is the system-wide concurrency cap; it self-tunes to the
+   provider's real capacity. Because there is no preemption between `await`
+   points, the shared counters/result maps need no locks.
 
-> **Memory note (honest scoping).** The queue and worker pool bound *in-flight*
-> work, not total process memory: the submitted prompt list and the aggregated
-> results are held in RAM for the life of the job, and file uploads are read
-> fully into memory. This is fine for batches of thousands. For truly flat
-> memory on huge inputs you'd add streaming/file-backed ingestion and a
-> spill-to-disk/DB result store (see README "Tradeoffs").
-2. **Workers** (`N = WORKER_POOL_SIZE`) loop on `await queue.get()`, process one
-   prompt at a time, and call `queue.task_done()`. The pool size is the hard cap
-   on simultaneous inference calls.
-3. **Completion** is detected with `await queue.join()` (all items processed),
-   after which the workers are cancelled and the job is marked `completed`.
+> **Memory note (honest scoping).** The scheduler/worker pool bound *in-flight*
+> work, not total process memory: the submitted prompts and aggregated results
+> live in RAM for the job's lifetime, and uploads are read fully into memory.
+> Fine for thousands of prompts. Truly flat memory on huge inputs needs
+> streaming/file-backed ingestion and a spill-to-DB result store (README
+> "Tradeoffs"; ADR-005).
 
-Because everything runs on one event loop, the shared counters and result map
-need no locks — there is no preemption between `await` points where we mutate
-them. The only lock is inside the mock client, used to make its 429 cadence
-deterministic across concurrent callers.
+See **[architecture-decisions.md](architecture-decisions.md)** for the ADRs
+behind each choice.

@@ -8,16 +8,31 @@ easy filtering and dashboards.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import sys
 import time
 
+# Carries the current request id across await points so every log line emitted
+# while handling a request can be correlated (set by the X-Request-ID middleware).
+request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_id", default=None
+)
+
 # Standard LogRecord attributes we don't want to duplicate in the JSON payload.
 _RESERVED = set(
     vars(logging.makeLogRecord({})).keys()
 ) | {"message", "asctime", "taskName"}
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = request_id_var.get()
+        if rid is not None:
+            record.request_id = rid
+        return True
 
 
 class JSONFormatter(logging.Formatter):
@@ -42,6 +57,7 @@ def setup_logging(level: str | None = None) -> None:
     level = (level or os.environ.get("LOG_LEVEL", "INFO")).upper()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
+    handler.addFilter(_RequestIdFilter())
 
     root = logging.getLogger()
     root.handlers = [handler]
