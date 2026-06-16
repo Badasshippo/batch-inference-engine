@@ -7,5 +7,7 @@ __pycache__/
 .coverage
 htmlcov/
 data/large_*.json
+data/server.log
+*.log
 .DS_Store
 .env
