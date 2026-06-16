@@ -11,6 +11,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -24,7 +25,8 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .engine import BatchEngine, IdempotencyConflictError, OverloadedError
@@ -400,6 +402,15 @@ async def job_events(job_id: str, request: Request) -> StreamingResponse:
 # Mount under /v1 (canonical) and at root (back-compat).
 app.include_router(api, prefix="/v1")
 app.include_router(api)
+
+# Operator dashboard – served from app/static/ui.html.
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/ui", include_in_schema=False)
+async def ui_dashboard() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "ui.html")
 
 
 @app.exception_handler(OverloadedError)

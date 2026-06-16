@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Batch Inference Engine · Dashboard</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #1e2130;
+  --border: #2a2d3a;
+  --accent: #4f8ef7;
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; min-height: 100vh; }
+
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 0 24px; display: flex; align-items: center; gap: 14px; height: 52px;
+}
+.logo { font-weight: 700; font-size: 15px; color: var(--accent); letter-spacing: -0.3px; }
+.version-tag { font-size: 11px; color: var(--muted); background: var(--border); padding: 2px 8px; border-radius: 99px; }
+header nav { margin-left: auto; display: flex; gap: 4px; }
+header nav a { color: var(--muted); text-decoration: none; padding: 5px 11px; border-radius: 6px; font-size: 12px; transition: all 0.15s; }
+header nav a:hover { color: var(--text); background: var(--border); }
+
+.layout { display: grid; grid-template-columns: 360px 1fr; height: calc(100vh - 52px); overflow: hidden; }
+
+.sidebar { background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+
+.section-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dot-ready { background: var(--success); box-shadow: 0 0 5px var(--success); }
+.dot-busy  { background: var(--warning); }
+.dot-down  { background: var(--error); }
+
+.cap-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cap-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.cap-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+.cap-val { font-size: 22px; font-weight: 700; font-family: var(--mono); }
+
+.divider { height: 1px; background: var(--border); }
+
+form { display: flex; flex-direction: column; gap: 10px; }
+.field-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; display: block; }
+textarea, select, input[type=text] {
+  width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 9px 11px; font-size: 13px; font-family: inherit; outline: none;
+  transition: border-color 0.15s;
+}
+textarea { font-family: var(--mono); min-height: 110px; resize: vertical; line-height: 1.5; }
+textarea:focus, select:focus, input[type=text]:focus { border-color: var(--accent); }
+.row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.btn { border: none; border-radius: 8px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; transition: all 0.15s; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: #3b7ce3; }
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-ghost { background: var(--border); color: var(--muted); }
+.btn-ghost:hover { color: var(--text); background: #32364a; }
+
+.content { overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+.empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); text-align: center; padding: 80px 20px; gap: 10px; }
+.empty-icon { font-size: 44px; opacity: 0.25; }
+.empty-title { font-size: 15px; font-weight: 600; color: var(--text); opacity: 0.4; }
+.empty-sub { font-size: 13px; max-width: 300px; line-height: 1.5; }
+
+.job-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; transition: border-color 0.2s; }
+.job-card.state-completed { border-color: rgba(34,197,94,0.3); }
+.job-card.state-failed { border-color: rgba(239,68,68,0.3); }
+
+.job-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-id-text { font-family: var(--mono); font-size: 11px; color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { font-size: 10px; font-weight: 700; padding: 3px 9px; border-radius: 99px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
+.b-running   { background: rgba(79,142,247,0.12); color: var(--accent); }
+.b-completed { background: rgba(34,197,94,0.12);  color: var(--success); }
+.b-failed    { background: rgba(239,68,68,0.12);  color: var(--error); }
+.b-cancelled { background: rgba(100,116,139,0.12); color: var(--muted); }
+.b-high      { background: rgba(239,68,68,0.10);  color: #f87171; }
+.b-normal    { background: rgba(100,116,139,0.10); color: var(--muted); }
+.b-low       { background: rgba(34,197,94,0.10);  color: #86efac; }
+
+.job-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.prog-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+.prog-track { height: 5px; background: var(--border); border-radius: 99px; overflow: hidden; }
+.prog-fill { height: 100%; background: var(--accent); border-radius: 99px; transition: width 0.35s ease; }
+.prog-fill.done { background: var(--success); }
+
+.meta-strip { display: flex; gap: 18px; flex-wrap: wrap; }
+.meta-kv .k { color: var(--muted); font-size: 11px; }
+.meta-kv .v { font-family: var(--mono); font-size: 12px; margin-left: 4px; }
+
+.results-toggle { font-size: 12px; color: var(--accent); cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 5px; }
+.results-toggle:hover { color: #7aadff; }
+
+.results-wrap { margin-top: 6px; overflow-x: auto; }
+table.rt { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.rt th { text-align: left; color: var(--muted); padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; white-space: nowrap; }
+table.rt td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.rt tr:last-child td { border-bottom: none; }
+.cell-prompt { color: var(--muted); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-output { font-family: var(--mono); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-ok { text-align: center; }
+.tick { color: var(--success); font-weight: 700; }
+.cross { color: var(--error); font-weight: 700; }
+.retry-warn { color: var(--warning); }
+
+.toasts { position: fixed; top: 60px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 999; pointer-events: none; }
+.toast { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.4); animation: tin .2s ease; pointer-events: auto; }
+.toast.ok  { border-left: 3px solid var(--success); }
+.toast.err { border-left: 3px solid var(--error); color: #fca5a5; }
+@keyframes tin { from { opacity:0; transform:translateX(16px); } to { opacity:1; transform:none; } }
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">⚡ Batch Inference Engine</span>
+  <span class="version-tag" id="versionTag">v—</span>
+  <nav>
+    <a href="/docs" target="_blank">Swagger</a>
+    <a href="/metrics" target="_blank">Metrics</a>
+    <a href="/readyz" target="_blank">Readiness</a>
+    <a href="/v1/system/capacity" target="_blank">Capacity</a>
+    <a href="https://github.com/Badasshippo/batch-inference-engine" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <div class="sidebar">
+
+    <!-- Capacity -->
+    <div>
+      <div class="section-title">
+        <span class="status-dot dot-down" id="readyDot"></span>
+        Service status
+        <span id="readyText" style="color:var(--muted);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0">checking…</span>
+      </div>
+      <div class="cap-grid">
+        <div class="cap-card">
+          <div class="cap-label">Active Jobs</div>
+          <div class="cap-val" id="cActive">—</div>
+        </div>
+        <div class="cap-card">
+          <div class="cap-label">Queue Depth</div>
+          <div class="cap-val" id="cQueue">—</div>
+        </div>
+        <div class="cap-card">
+          <div class="cap-label">In-Flight</div>
+          <div class="cap-val" id="cInflight">—</div>
+        </div>
+        <div class="cap-card">
+          <div class="cap-label">Concurrency Cap</div>
+          <div class="cap-val" id="cLimit">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- Submit form -->
+    <div>
+      <div class="section-title">Submit a batch</div>
+      <form id="submitForm">
+        <div>
+          <label class="field-label">Prompts — one per line</label>
+          <textarea id="promptsInput" placeholder="What is machine learning?&#10;Explain transformers&#10;What is a rate limiter?"></textarea>
+        </div>
+        <div class="row-2">
+          <div>
+            <label class="field-label">Priority</label>
+            <select id="priority">
+              <option value="normal">Normal</option>
+              <option value="high">High</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label">Idempotency-Key</label>
+            <input type="text" id="ikey" placeholder="auto">
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="submitBtn">Submit Batch</button>
+        <button type="button" class="btn btn-ghost" id="sampleBtn">Load sample prompts</button>
+      </form>
+    </div>
+
+  </div>
+
+  <div class="content" id="content">
+    <div class="empty-state" id="emptyState">
+      <div class="empty-icon">📦</div>
+      <div class="empty-title">No jobs yet</div>
+      <div class="empty-sub">Submit a batch on the left to see live progress, results, cost, and retry telemetry here.</div>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+const SAMPLES = [
+  "What is machine learning?",
+  "Explain transformer architecture",
+  "What is a batch inference engine?",
+  "Define latency vs throughput",
+  "What is exponential backoff with jitter?",
+  "Explain the AIMD congestion control algorithm",
+  "What is a token bucket rate limiter?",
+  "How does a weighted round-robin scheduler work?",
+  "What is a dead letter queue?",
+  "Why is idempotency important in distributed systems?"
+];
+
+/* ── helpers ── */
+async function apiFetch(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(body.detail || r.statusText), { status: r.status });
+  return body;
+}
+
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toasts').prepend(el);
+  setTimeout(() => el.remove(), 3800);
+}
+
+function badge(cls, txt) { return `<span class="badge b-${cls}">${txt}</span>`; }
+
+/* ── capacity ── */
+async function refreshCapacity() {
+  try {
+    const d = await apiFetch('/v1/system/capacity');
+    document.getElementById('cActive').textContent   = d.active_jobs;
+    document.getElementById('cQueue').textContent    = d.queue_depth;
+    document.getElementById('cInflight').textContent = d.inflight;
+    document.getElementById('cLimit').textContent    = d.concurrency_limit;
+    const dot = document.getElementById('readyDot');
+    const lbl = document.getElementById('readyText');
+    if (!d.accepting)    { dot.className = 'status-dot dot-down';  lbl.textContent = 'draining / shutdown'; }
+    else if (d.saturated){ dot.className = 'status-dot dot-busy';  lbl.textContent = 'saturated'; }
+    else                 { dot.className = 'status-dot dot-ready'; lbl.textContent = 'ready'; }
+  } catch {
+    document.getElementById('readyDot').className = 'status-dot dot-down';
+    document.getElementById('readyText').textContent = 'unreachable';
+  }
+}
+
+/* ── sample ── */
+document.getElementById('sampleBtn').onclick = () => {
+  document.getElementById('promptsInput').value = SAMPLES.join('\n');
+  document.getElementById('priority').value = 'normal';
+};
+
+/* ── build card ── */
+function createCard(job) {
+  document.getElementById('emptyState')?.remove();
+  const el = document.createElement('div');
+  el.className = 'job-card';
+  el.id = 'jc-' + job.job_id;
+  el.innerHTML = `
+    <div class="job-header">
+      <span class="job-id-text" title="${job.job_id}">${job.job_id.slice(0,20)}…</span>
+      ${badge(job.priority || 'normal', job.priority || 'normal')}
+      <span class="state-badge">${badge('running','running')}</span>
+    </div>
+    <div class="job-body">
+      <div>
+        <div class="prog-row">
+          <span class="prog-label">0 / ${job.total} prompts</span>
+          <span class="prog-pct">0%</span>
+        </div>
+        <div class="prog-track"><div class="prog-fill" style="width:0%"></div></div>
+      </div>
+      <div class="meta-strip">
+        <span class="meta-kv"><span class="k">Succeeded</span><span class="v succ-v">0</span></span>
+        <span class="meta-kv"><span class="k">Failed</span><span class="v fail-v">0</span></span>
+        <span class="meta-kv"><span class="k">Retries</span><span class="v retry-v">0</span></span>
+        <span class="meta-kv"><span class="k">Cost</span><span class="v cost-v">—</span></span>
+        <span class="meta-kv"><span class="k">Duration</span><span class="v dur-v">—</span></span>
+      </div>
+      <div class="results-sec" style="display:none">
+        <span class="results-toggle" onclick="toggleResults(this)">▶ Show results</span>
+        <div class="results-wrap" style="display:none"></div>
+      </div>
+    </div>`;
+  document.getElementById('content').prepend(el);
+  return el;
+}
+
+function updateCard(el, d) {
+  const pct = d.total > 0 ? Math.round((d.completed / d.total) * 100) : 0;
+  el.querySelector('.prog-label').textContent = `${d.completed} / ${d.total} prompts`;
+  el.querySelector('.prog-pct').textContent   = pct + '%';
+  const fill = el.querySelector('.prog-fill');
+  fill.style.width = pct + '%';
+  if (d.state === 'completed') fill.classList.add('done');
+  el.querySelector('.succ-v').textContent  = d.succeeded;
+  el.querySelector('.fail-v').textContent  = d.failed;
+  el.querySelector('.retry-v').textContent = d.retries;
+  el.querySelector('.retry-v').className   = 'v retry-v' + (d.retries > 0 ? ' retry-warn' : '');
+  if (d.cost) el.querySelector('.cost-v').textContent = '$' + d.cost.estimated_cost_usd.toFixed(6);
+  if (d.duration_seconds != null) el.querySelector('.dur-v').textContent = d.duration_seconds.toFixed(3) + 's';
+  el.querySelector('.state-badge').innerHTML = badge(d.state, d.state);
+  el.className = 'job-card state-' + d.state;
+}
+
+async function loadResults(el, jobId) {
+  const data = await apiFetch(`/v1/jobs/${jobId}/results`);
+  const rows = data.results.map(r => `<tr>
+    <td class="cell-prompt" title="${r.prompt}">${r.prompt}</td>
+    <td class="cell-output" title="${r.output || r.error || ''}">${r.output || r.error || '—'}</td>
+    <td class="cell-ok">${r.success ? '<span class="tick">✓</span>' : '<span class="cross">✗</span>'}</td>
+    <td style="font-family:var(--mono);font-size:11px;text-align:center" class="${r.attempts > 1 ? 'retry-warn' : ''}">${r.attempts}</td>
+    <td style="font-family:var(--mono);font-size:11px">${r.cost_usd != null ? '$'+r.cost_usd.toFixed(6) : '—'}</td>
+  </tr>`).join('');
+  el.querySelector('.results-wrap').innerHTML = `
+    <table class="rt">
+      <thead><tr><th>Prompt</th><th>Output</th><th>OK</th><th>Tries</th><th>Cost</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  el.querySelector('.results-sec').style.display = '';
+}
+
+function toggleResults(btn) {
+  const wrap = btn.nextElementSibling;
+  const open = wrap.style.display !== 'none';
+  wrap.style.display = open ? 'none' : '';
+  btn.textContent = (open ? '▶' : '▼') + (open ? ' Show results' : ' Hide results');
+}
+
+function pollJob(jobId, el) {
+  const iv = setInterval(async () => {
+    try {
+      const d = await apiFetch(`/v1/jobs/${jobId}`);
+      updateCard(el, d);
+      if (['completed','failed','cancelled'].includes(d.state)) {
+        clearInterval(iv);
+        await loadResults(el, jobId);
+        refreshCapacity();
+      }
+    } catch { clearInterval(iv); }
+  }, 1000);
+}
+
+/* ── submit ── */
+document.getElementById('submitForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const raw = document.getElementById('promptsInput').value.trim();
+  if (!raw) { toast('Enter at least one prompt.', 'err'); return; }
+  const prompts = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  const priority = document.getElementById('priority').value;
+  const ikey = document.getElementById('ikey').value.trim() || `ui-${Date.now()}`;
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  try {
+    const job = await apiFetch('/v1/batches', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': ikey,
+        'X-Request-ID': 'ui-' + Date.now(),
+      },
+      body: JSON.stringify({ prompts: prompts.map(p => ({ prompt: p })), priority }),
+    });
+    if (job.idempotent_reuse) {
+      toast(`Idempotent reuse — returned existing job ${job.job_id.slice(0,8)}…`, '');
+    } else {
+      toast(`Accepted — ${job.total} prompts queued as ${job.priority}`, 'ok');
+    }
+    const card = createCard(job);
+    updateCard(card, { completed:0, total:job.total, succeeded:0, failed:0, retries:0, state:'running', cost:null, duration_seconds:null });
+    pollJob(job.job_id, card);
+    refreshCapacity();
+    document.getElementById('ikey').value = '';
+  } catch (err) {
+    const label = err.status === 409 ? '409 Idempotency conflict — different payload for same key'
+                : err.status === 503 ? '503 Service overloaded — try again shortly'
+                : err.message || 'Submission failed';
+    toast(label, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit Batch';
+  }
+});
+
+/* ── boot ── */
+refreshCapacity();
+setInterval(refreshCapacity, 5000);
+apiFetch('/healthz').then(d => {
+  document.getElementById('versionTag').textContent = 'v' + (d.version || '?');
+}).catch(() => {});
+</script>
+</body>
+</html>
