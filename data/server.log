@@ -1,0 +1,36 @@
+INFO:     Started server process [9495]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:52676 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52680 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52682 - "POST /batches/upload HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:52688 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52696 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52712 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52718 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52722 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52736 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52752 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52754 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52766 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52778 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52786 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52794 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52806 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52808 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52820 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52832 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52836 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52852 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52868 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52870 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52886 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52888 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52900 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52908 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52920 - "GET /jobs/fcf1d2fc03c54b15b2e922ad4c812d8e/results HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [9495]
