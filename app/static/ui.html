@@ -190,6 +190,10 @@ table.rt tr:last-child td { border-bottom: none; }
             <input type="text" id="ikey" placeholder="auto">
           </div>
         </div>
+        <div>
+          <label class="field-label">API Key <span style="color:var(--muted);font-weight:400">(X-API-Key — leave blank if unset)</span></label>
+          <input type="password" id="apiKey" placeholder="optional">
+        </div>
         <button type="submit" class="btn btn-primary" id="submitBtn">Submit Batch</button>
         <button type="button" class="btn btn-ghost" id="sampleBtn">Load sample prompts</button>
       </form>
@@ -209,6 +213,11 @@ table.rt tr:last-child td { border-bottom: none; }
 <div class="toasts" id="toasts"></div>
 
 <script>
+/* ── XSS guard ── */
+function esc(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 const SAMPLES = [
   "What is machine learning?",
   "Explain transformer architecture",
@@ -320,13 +329,17 @@ function updateCard(el, d) {
 
 async function loadResults(el, jobId) {
   const data = await apiFetch(`/v1/jobs/${jobId}/results`);
-  const rows = data.results.map(r => `<tr>
-    <td class="cell-prompt" title="${r.prompt}">${r.prompt}</td>
-    <td class="cell-output" title="${r.output || r.error || ''}">${r.output || r.error || '—'}</td>
+  const rows = data.results.map(r => {
+    const prompt = esc(r.prompt);
+    const output = esc(r.output || r.error || '—');
+    return `<tr>
+    <td class="cell-prompt" title="${prompt}">${prompt}</td>
+    <td class="cell-output" title="${output}">${output}</td>
     <td class="cell-ok">${r.success ? '<span class="tick">✓</span>' : '<span class="cross">✗</span>'}</td>
     <td style="font-family:var(--mono);font-size:11px;text-align:center" class="${r.attempts > 1 ? 'retry-warn' : ''}">${r.attempts}</td>
     <td style="font-family:var(--mono);font-size:11px">${r.cost_usd != null ? '$'+r.cost_usd.toFixed(6) : '—'}</td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
   el.querySelector('.results-wrap').innerHTML = `
     <table class="rt">
       <thead><tr><th>Prompt</th><th>Output</th><th>OK</th><th>Tries</th><th>Cost</th></tr></thead>
@@ -364,16 +377,19 @@ document.getElementById('submitForm').addEventListener('submit', async e => {
   const prompts = raw.split('\n').map(l => l.trim()).filter(Boolean);
   const priority = document.getElementById('priority').value;
   const ikey = document.getElementById('ikey').value.trim() || `ui-${Date.now()}`;
+  const apiKey = document.getElementById('apiKey').value.trim();
   const btn = document.getElementById('submitBtn');
   btn.disabled = true; btn.textContent = 'Submitting…';
   try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': ikey,
+      'X-Request-ID': 'ui-' + Date.now(),
+    };
+    if (apiKey) headers['X-API-Key'] = apiKey;
     const job = await apiFetch('/v1/batches', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Idempotency-Key': ikey,
-        'X-Request-ID': 'ui-' + Date.now(),
-      },
+      headers,
       body: JSON.stringify({ prompts: prompts.map(p => ({ prompt: p })), priority }),
     });
     if (job.idempotent_reuse) {
