@@ -50,13 +50,13 @@ header nav a:hover { color: var(--text); background: var(--border); }
 
 form { display: flex; flex-direction: column; gap: 10px; }
 .field-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; display: block; }
-textarea, select, input[type=text] {
+textarea, select, input[type=text], input[type=password], input[type=number] {
   width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
   border-radius: 8px; padding: 9px 11px; font-size: 13px; font-family: inherit; outline: none;
   transition: border-color 0.15s;
 }
 textarea { font-family: var(--mono); min-height: 110px; resize: vertical; line-height: 1.5; }
-textarea:focus, select:focus, input[type=text]:focus { border-color: var(--accent); }
+textarea:focus, select:focus, input[type=text]:focus, input[type=password]:focus, input[type=number]:focus { border-color: var(--accent); }
 .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .btn { border: none; border-radius: 8px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; transition: all 0.15s; }
 .btn-primary { background: var(--accent); color: #fff; }
@@ -116,6 +116,33 @@ table.rt tr:last-child td { border-bottom: none; }
 .toast.ok  { border-left: 3px solid var(--success); }
 .toast.err { border-left: 3px solid var(--error); color: #fca5a5; }
 @keyframes tin { from { opacity:0; transform:translateX(16px); } to { opacity:1; transform:none; } }
+
+/* ── metrics strip ── */
+.metrics-strip { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; flex-shrink: 0; }
+.mc { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.mc-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
+.mc-val { font-size: 19px; font-weight: 700; font-family: var(--mono); margin-bottom: 6px; line-height: 1; }
+canvas.spark { width: 100%; height: 26px; display: block; }
+
+/* ── event log ── */
+.ev-toggle { font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+.ev-toggle:hover { color: var(--text); }
+.ev-log { max-height: 100px; overflow-y: auto; background: var(--bg); border-radius: 6px; padding: 7px 9px; font-family: var(--mono); font-size: 11px; line-height: 1.7; margin-top: 6px; }
+.ev-row { display: flex; gap: 8px; }
+.ev-time { color: var(--muted); flex-shrink: 0; }
+.ev-type { font-weight: 700; }
+.ev-type.t-job_started,.ev-type.t-job_completed { color: var(--success); }
+.ev-type.t-prompt_completed { color: var(--accent); }
+.ev-type.t-prompt_failed { color: var(--error); }
+.ev-type.t-job_failed { color: var(--error); }
+
+/* ── export buttons ── */
+.export-row { display: flex; gap: 6px; }
+.btn-xs { border: none; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer; background: var(--border); color: var(--muted); transition: all 0.15s; }
+.btn-xs:hover { color: var(--text); background: #32364a; }
+
+/* ── cost estimate ── */
+.cost-est { font-size: 11px; color: var(--muted); min-height: 15px; }
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -179,6 +206,7 @@ table.rt tr:last-child td { border-bottom: none; }
           </label>
           <textarea id="promptsInput" placeholder='One per line:&#10;What is machine learning?&#10;Explain transformers&#10;&#10;Or paste a JSON array:&#10;["hello", "world"]&#10;&#10;Or objects:&#10;[{"prompt":"hi"},{"prompt":"bye"}]'></textarea>
           <div id="parseHint" style="font-size:11px;color:var(--muted);margin-top:2px;min-height:14px"></div>
+          <div class="cost-est" id="costEst"></div>
         </div>
         <div class="row-2">
           <div>
@@ -222,6 +250,31 @@ table.rt tr:last-child td { border-bottom: none; }
   </div>
 
   <div class="content" id="content">
+
+    <!-- Live metrics strip -->
+    <div class="metrics-strip" id="metricsStrip">
+      <div class="mc">
+        <div class="mc-label">Completed</div>
+        <div class="mc-val" id="mCompleted">—</div>
+        <canvas class="spark" id="spCompleted" width="200" height="26"></canvas>
+      </div>
+      <div class="mc">
+        <div class="mc-label">Throughput / s</div>
+        <div class="mc-val" id="mThroughput">—</div>
+        <canvas class="spark" id="spThroughput" width="200" height="26"></canvas>
+      </div>
+      <div class="mc">
+        <div class="mc-label">In-Flight</div>
+        <div class="mc-val" id="mInflight">—</div>
+        <canvas class="spark" id="spInflight" width="200" height="26"></canvas>
+      </div>
+      <div class="mc">
+        <div class="mc-label">Retries</div>
+        <div class="mc-val" id="mRetries">—</div>
+        <canvas class="spark" id="spRetries" width="200" height="26"></canvas>
+      </div>
+    </div>
+
     <div class="empty-state" id="emptyState">
       <div class="empty-icon">📦</div>
       <div class="empty-title">No jobs yet</div>
@@ -291,14 +344,15 @@ function parsePrompts(raw) {
   return { prompts, hint: prompts.length > 1 ? `${prompts.length} prompts (one per line)` : '' };
 }
 
-// Live parse hint as user types
+// Live parse hint + cost estimate as user types
 document.addEventListener('DOMContentLoaded', () => {
   const ta = document.getElementById('promptsInput');
   const hint = document.getElementById('parseHint');
-  if (ta && hint) {
+  if (ta) {
     ta.addEventListener('input', () => {
       const result = parsePrompts(ta.value);
-      hint.textContent = result.hint || '';
+      if (hint) hint.textContent = result.hint || '';
+      updateCostEstimate(ta.value);
     });
   }
 });
@@ -391,8 +445,18 @@ function createCard(job) {
         <span class="meta-kv"><span class="k">Cost</span><span class="v cost-v">—</span></span>
         <span class="meta-kv"><span class="k">Duration</span><span class="v dur-v">—</span></span>
       </div>
+      <div class="ev-sec">
+        <span class="ev-toggle" onclick="toggleEl(this.nextElementSibling)">▸ Live events</span>
+        <div class="ev-log" style="display:none"></div>
+      </div>
       <div class="results-sec" style="display:none">
-        <span class="results-toggle" onclick="toggleResults(this)">▶ Show results</span>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span class="results-toggle" onclick="toggleResults(this.closest('.results-sec').querySelector('.results-wrap'))">▶ Show results</span>
+          <div class="export-row" style="display:none">
+            <button class="btn-xs" onclick="exportJob(this,'json')">↓ JSON</button>
+            <button class="btn-xs" onclick="exportJob(this,'csv')">↓ CSV</button>
+          </div>
+        </div>
         <div class="results-wrap" style="display:none"></div>
       </div>
     </div>`;
@@ -436,13 +500,21 @@ async function loadResults(el, jobId) {
       <tbody>${rows}</tbody>
     </table>`;
   el.querySelector('.results-sec').style.display = '';
+  const exportRow = el.querySelector('.export-row');
+  if (exportRow) exportRow.style.display = '';
+  // store job_id on the card for export
+  el.dataset.jobId = jobId;
 }
 
-function toggleResults(btn) {
-  const wrap = btn.nextElementSibling;
+function toggleEl(el) {
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+function toggleResults(wrap) {
   const open = wrap.style.display !== 'none';
   wrap.style.display = open ? 'none' : '';
-  btn.textContent = (open ? '▶' : '▼') + (open ? ' Show results' : ' Hide results');
+  const btn = wrap.closest('.results-sec').querySelector('.results-toggle');
+  if (btn) btn.textContent = (open ? '▶' : '▼') + (open ? ' Show results' : ' Hide results');
 }
 
 function pollJob(jobId, el) {
@@ -492,6 +564,7 @@ document.getElementById('submitForm').addEventListener('submit', async e => {
     const card = createCard(job);
     updateCard(card, { completed:0, total:job.total, succeeded:0, failed:0, retries:0, state:'running', cost:null, duration_seconds:null });
     pollJob(job.job_id, card);
+    openEventStream(job.job_id, card);
     refreshCapacity();
     document.getElementById('ikey').value = '';
   } catch (err) {
@@ -503,6 +576,155 @@ document.getElementById('submitForm').addEventListener('submit', async e => {
     btn.disabled = false; btn.textContent = 'Submit Batch';
   }
 });
+
+/* ── sparklines ── */
+class Sparkline {
+  constructor(canvasId, color) {
+    this.canvas = document.getElementById(canvasId);
+    this.color = color;
+    this.data = [];
+    this.max = 40;
+  }
+  push(v) {
+    this.data.push(v);
+    if (this.data.length > this.max) this.data.shift();
+    this._draw();
+  }
+  _draw() {
+    if (!this.canvas) return;
+    const ctx = this.canvas.getContext('2d');
+    const W = this.canvas.width, H = this.canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const d = this.data;
+    if (d.length < 2) return;
+    const min = Math.min(...d), max = Math.max(...d);
+    const range = max - min || 1;
+    const xStep = W / (d.length - 1);
+    const yOf = v => H - 3 - ((v - min) / range) * (H - 6);
+    ctx.beginPath();
+    d.forEach((v, i) => { i === 0 ? ctx.moveTo(0, yOf(v)) : ctx.lineTo(i * xStep, yOf(v)); });
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    // fill under
+    ctx.lineTo((d.length - 1) * xStep, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fillStyle = this.color + '28';
+    ctx.fill();
+  }
+}
+
+const spCompleted  = new Sparkline('spCompleted',  '#4f8ef7');
+const spThroughput = new Sparkline('spThroughput', '#22c55e');
+const spInflight   = new Sparkline('spInflight',   '#f59e0b');
+const spRetries    = new Sparkline('spRetries',    '#ef4444');
+
+let _prevCompleted = null, _prevRetriesTotal = null, _lastMetricTs = null;
+
+async function refreshMetrics() {
+  try {
+    const txt = await fetch('/metrics').then(r => r.text());
+    const get = name => {
+      const m = txt.match(new RegExp(`^${name}\\s+([\\d.e+\\-]+)`, 'm'));
+      return m ? parseFloat(m[1]) : null;
+    };
+    const completed = get('batch_prompts_completed_total');
+    const inflight  = get('inflight');
+    const retries   = get('inference_retries_total');
+    const now = Date.now();
+
+    if (completed != null) {
+      document.getElementById('mCompleted').textContent = completed;
+      spCompleted.push(completed);
+      if (_prevCompleted != null && _lastMetricTs != null) {
+        const dt = (now - _lastMetricTs) / 1000;
+        const tps = dt > 0 ? ((completed - _prevCompleted) / dt).toFixed(1) : 0;
+        document.getElementById('mThroughput').textContent = tps;
+        spThroughput.push(parseFloat(tps));
+      }
+      _prevCompleted = completed;
+    }
+    if (inflight != null) {
+      document.getElementById('mInflight').textContent = inflight;
+      spInflight.push(inflight);
+    }
+    if (retries != null) {
+      document.getElementById('mRetries').textContent = retries;
+      spRetries.push(retries);
+      _prevRetriesTotal = retries;
+    }
+    _lastMetricTs = now;
+  } catch { /* metrics unreachable */ }
+}
+
+/* ── SSE event stream ── */
+function openEventStream(jobId, el) {
+  const log = el.querySelector('.ev-log');
+  if (!log) return;
+  try {
+    const src = new EventSource(`/v1/jobs/${jobId}/events`);
+    const append = (type, data) => {
+      const row = document.createElement('div');
+      row.className = 'ev-row';
+      const t = new Date().toISOString().slice(11, 19);
+      row.innerHTML = `<span class="ev-time">${t}</span><span class="ev-type t-${type}">${type}</span><span style="color:var(--muted)">${esc(data)}</span>`;
+      log.appendChild(row);
+      log.scrollTop = log.scrollHeight;
+      if (log.children.length > 60) log.removeChild(log.firstChild);
+    };
+    ['job_started','prompt_completed','prompt_failed','job_completed','job_failed'].forEach(ev => {
+      src.addEventListener(ev, e => {
+        try {
+          const d = JSON.parse(e.data);
+          const detail = d.prompt_id ? `${d.prompt_id} (${d.status || ''})` : (d.job_id || '');
+          append(ev, detail);
+        } catch { append(ev, e.data || ''); }
+      });
+    });
+    src.addEventListener('job_completed', () => src.close());
+    src.addEventListener('job_failed',    () => src.close());
+    src.onerror = () => src.close();
+  } catch { /* EventSource not supported */ }
+}
+
+/* ── export results ── */
+async function exportJob(btn, fmt) {
+  const card = btn.closest('.job-card');
+  const jobId = card?.dataset?.jobId;
+  if (!jobId) return;
+  try {
+    const data = await apiFetch(`/v1/jobs/${jobId}/results?limit=10000`);
+    if (fmt === 'json') {
+      _download(`job-${jobId.slice(0,8)}.json`, 'application/json', JSON.stringify(data.results, null, 2));
+    } else {
+      const cols = ['id','prompt','success','output','error','attempts','cost_usd'];
+      const rows = [cols.join(','),
+        ...data.results.map(r => cols.map(k => JSON.stringify(r[k] ?? '')).join(','))
+      ].join('\n');
+      _download(`job-${jobId.slice(0,8)}.csv`, 'text/csv', rows);
+    }
+  } catch(e) { toast('Export failed: ' + e.message, 'err'); }
+}
+function _download(name, mime, content) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content], {type: mime}));
+  a.download = name;
+  a.click();
+}
+
+/* ── cost estimate ── */
+function updateCostEstimate(raw) {
+  const el = document.getElementById('costEst');
+  if (!el) return;
+  const { prompts } = parsePrompts(raw);
+  if (!prompts.length) { el.textContent = ''; return; }
+  const totalChars = prompts.reduce((s, p) => s + p.length, 0);
+  const tokens = Math.ceil(totalChars / 4);
+  const cost = (tokens / 1000) * 0.002;  // $0.002 / 1k tokens (GPT-3.5 estimate)
+  el.textContent = `${prompts.length} prompts · ~${tokens.toLocaleString()} tokens · ~$${cost.toFixed(4)} estimated`;
+}
 
 /* ── self-test ── */
 async function runSelfTest() {
@@ -556,6 +778,8 @@ async function runSelfTest() {
 /* ── boot ── */
 refreshCapacity();
 setInterval(refreshCapacity, 5000);
+refreshMetrics();
+setInterval(refreshMetrics, 2000);
 apiFetch('/healthz').then(d => {
   document.getElementById('versionTag').textContent = 'v' + (d.version || '?');
 }).catch(() => {});
