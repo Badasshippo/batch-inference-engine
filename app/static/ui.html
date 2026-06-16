@@ -631,7 +631,7 @@ async function refreshMetrics() {
       return m ? parseFloat(m[1]) : null;
     };
     const completed = get('batch_prompts_completed_total');
-    const inflight  = get('inflight');
+    const inflight  = get('inference_inflight');
     const retries   = get('inference_retries_total');
     const now = Date.now();
 
@@ -674,17 +674,26 @@ function openEventStream(jobId, el) {
       log.scrollTop = log.scrollHeight;
       if (log.children.length > 60) log.removeChild(log.firstChild);
     };
-    ['job_started','prompt_completed','prompt_failed','job_completed','job_failed'].forEach(ev => {
+    // Backend emits: job_started, progress (per-tick), job_completed, job_failed
+    src.addEventListener('job_started', e => {
+      try { const d = JSON.parse(e.data); append('job_started', `${d.total} prompts queued`); }
+      catch { append('job_started', ''); }
+    });
+    src.addEventListener('progress', e => {
+      try {
+        const d = JSON.parse(e.data);
+        append('progress', `${d.completed}/${d.total} · ${d.succeeded} ok · ${d.retries} retries`);
+      } catch { append('progress', e.data || ''); }
+    });
+    ['job_completed','job_failed'].forEach(ev => {
       src.addEventListener(ev, e => {
         try {
           const d = JSON.parse(e.data);
-          const detail = d.prompt_id ? `${d.prompt_id} (${d.status || ''})` : (d.job_id || '');
-          append(ev, detail);
+          append(ev, `${d.succeeded} succeeded · ${d.failed} failed · ${d.retries} retries`);
         } catch { append(ev, e.data || ''); }
+        src.close();
       });
     });
-    src.addEventListener('job_completed', () => src.close());
-    src.addEventListener('job_failed',    () => src.close());
     src.onerror = () => src.close();
   } catch { /* EventSource not supported */ }
 }
@@ -695,13 +704,22 @@ async function exportJob(btn, fmt) {
   const jobId = card?.dataset?.jobId;
   if (!jobId) return;
   try {
-    const data = await apiFetch(`/v1/jobs/${jobId}/results?limit=10000`);
+    // Page through all results in chunks of 1000 (backend max per request).
+    const PAGE = 1000;
+    let all = [], offset = 0, total = Infinity;
+    while (all.length < total) {
+      const data = await apiFetch(`/v1/jobs/${jobId}/results?limit=${PAGE}&offset=${offset}`);
+      if (total === Infinity) total = data.total ?? data.results.length;
+      all = all.concat(data.results);
+      offset += PAGE;
+      if (data.results.length < PAGE) break;
+    }
     if (fmt === 'json') {
-      _download(`job-${jobId.slice(0,8)}.json`, 'application/json', JSON.stringify(data.results, null, 2));
+      _download(`job-${jobId.slice(0,8)}.json`, 'application/json', JSON.stringify(all, null, 2));
     } else {
       const cols = ['id','prompt','success','output','error','attempts','cost_usd'];
       const rows = [cols.join(','),
-        ...data.results.map(r => cols.map(k => JSON.stringify(r[k] ?? '')).join(','))
+        ...all.map(r => cols.map(k => JSON.stringify(r[k] ?? '')).join(','))
       ].join('\n');
       _download(`job-${jobId.slice(0,8)}.csv`, 'text/csv', rows);
     }

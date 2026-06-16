@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 from .models import JobState, Priority, PromptItem
@@ -53,7 +54,9 @@ async def _poll(engine: "BatchEngine", job_id: str, timeout: float = 60.0):
 async def run_self_test(engine: "BatchEngine", n: int = 50) -> dict:
     """Run the full invariant suite. Safe to call on the live deployment."""
     n = max(5, min(n, 200))
-    ts = int(time.time())
+    # Unique run ID per invocation — avoids second-resolution timestamp collisions
+    # when self-test is called multiple times in quick succession.
+    run_id = uuid.uuid4().hex
 
     def make_prompts(tag: str, count: int) -> list[PromptItem]:
         return [
@@ -66,7 +69,7 @@ async def run_self_test(engine: "BatchEngine", n: int = 50) -> dict:
     # ── 1. Immediate ACK ────────────────────────────────────────────────────
     t0 = time.perf_counter()
     primary_prompts = make_prompts("st", n)
-    ikey = f"self-test-{ts}"
+    ikey = f"self-test-{run_id}"
     job, _ = await engine.submit_with_idempotency(
         primary_prompts, priority=Priority.LOW, idempotency_key=ikey
     )
@@ -84,7 +87,7 @@ async def run_self_test(engine: "BatchEngine", n: int = 50) -> dict:
     fair_job, _ = await engine.submit_with_idempotency(
         fairness_prompts,
         priority=Priority.NORMAL,
-        idempotency_key=f"self-test-fair-{ts}",
+        idempotency_key=f"self-test-fair-{run_id}",
     )
 
     # ── 4. Poll primary job; track peak inflight ─────────────────────────────
@@ -110,7 +113,11 @@ async def run_self_test(engine: "BatchEngine", n: int = 50) -> dict:
     checks["all_prompts_aggregated"]   = job.completed == n
     checks["no_prompts_dropped"]       = (job.succeeded + job.failed) == n
     checks["retry_recovery_observed"]  = job.retries > 0   # informational only
-    checks["concurrency_cap_respected"] = peak_inflight <= engine._limiter.limit
+    # Compare against the configured global cap, not the adaptive limit (which
+    # may have been reduced by AIMD below its starting value mid-test).
+    checks["concurrency_cap_respected"] = (
+        peak_inflight <= engine.settings.global_max_concurrency
+    )
     checks["queue_drained"]            = engine.scheduler.pending == 0
     checks["fair_scheduling"]          = (
         fair_job is not None
