@@ -47,7 +47,8 @@ services:
 
 What you get out of the box:
 
-- **Health checks** against `/healthz` (rolling deploys wait for healthy).
+- **Health checks** against `/readyz` (rolling deploys wait until the instance
+  reports ready; it returns `503` while draining or saturated).
 - **Logs & metrics / insights** in the App Platform dashboard; the app emits
   structured JSON logs and exposes Prometheus metrics at `/metrics`.
 - **Log forwarding** to an external sink (Datadog/Logtail/Papertrail) if desired.
@@ -134,7 +135,8 @@ spec:
 
 Operational notes:
 
-- **Readiness/liveness probes** use `/healthz`. The app's graceful shutdown
+- **Readiness probe** uses `/readyz` and the **liveness probe** uses `/livez`.
+  The app's graceful shutdown
   (`GRACEFUL_SHUTDOWN_SECONDS`) lets in-flight prompts drain before the pod dies,
   pairing with `terminationGracePeriodSeconds` and the `preStop` hook for
   zero-drop rolling deploys.
@@ -151,7 +153,8 @@ Operational notes:
 
 | Signal | Where |
 |---|---|
-| Liveness/readiness | `GET /healthz` |
+| Liveness | `GET /livez` (process is up) |
+| Readiness | `GET /readyz` (`503` while draining/saturated) |
 | Metrics (Prometheus) | `GET /metrics` — counters (`batch_prompts_completed_total`, `inference_rate_limited_total`, …) + histograms (`inference_latency_seconds`, `job_duration_seconds`) |
 | Logs | structured JSON on stdout (`job_id`, `prompt_id`, `attempt`, `status`, `latency_ms`) |
 | Backpressure | `429`/`503 + Retry-After` when overloaded |

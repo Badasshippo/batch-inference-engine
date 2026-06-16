@@ -22,10 +22,9 @@ USER appuser
 
 EXPOSE 8080
 
-# Container-native health check hitting the liveness endpoint.
-# urlopen raises on a non-200 response, so a clean exit means healthy.
+# Container-native liveness probe (/livez). App Platform uses /readyz separately.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/healthz', timeout=2)" || exit 1
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/livez', timeout=2)" || exit 1
 
 # Honor the platform-provided $PORT (App Platform, Cloud Run, etc.).
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
