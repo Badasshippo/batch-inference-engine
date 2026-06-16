@@ -120,6 +120,25 @@ class DeadLetterResponse(BaseModel):
     items: list[InferenceResult]
 
 
+class JobSummary(BaseModel):
+    job_id: str
+    state: JobState
+    priority: Priority
+    total: int
+    completed: int
+    succeeded: int
+    failed: int
+    created_at: float
+
+
+class JobsListResponse(BaseModel):
+    total: int
+    returned: int
+    limit: int
+    offset: int
+    jobs: list[JobSummary]
+
+
 # --------------------------------------------------------------------------- #
 # Internal (non-serialized) structures
 # --------------------------------------------------------------------------- #

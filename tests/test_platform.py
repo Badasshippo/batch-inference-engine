@@ -194,6 +194,37 @@ async def test_sse_events_stream(client):
     assert "job_completed" in events
 
 
+async def test_jobs_list_and_filter(client):
+    a = (await client.post("/v1/batches", json={"prompts": [{"prompt": "a"}]})).json()
+    await client.post("/v1/batches", json={"prompts": [{"prompt": "b"}]})
+
+    listing = (await client.get("/v1/jobs?limit=10")).json()
+    assert listing["total"] == 2
+    assert listing["returned"] == 2
+
+    await _poll(client, "/v1/jobs/" + a["job_id"])
+    completed = (await client.get("/v1/jobs?state=completed")).json()
+    assert completed["total"] >= 1
+    assert all(j["state"] == "completed" for j in completed["jobs"])
+
+
+async def test_api_key_enforced_when_configured(client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    # Missing key -> 401.
+    r = await client.post("/v1/batches", json={"prompts": [{"prompt": "a"}]})
+    assert r.status_code == 401
+    # Correct key -> accepted.
+    r = await client.post(
+        "/v1/batches",
+        json={"prompts": [{"prompt": "a"}]},
+        headers={"X-API-Key": "s3cret"},
+    )
+    assert r.status_code == 202
+    # Health/metrics remain open (not behind the API key).
+    assert (await client.get("/healthz")).status_code == 200
+    assert (await client.get("/metrics")).status_code == 200
+
+
 async def test_dead_letter_endpoint(client):
     # Force failures via the upload path is hard; use the JSON path with a
     # prompt the default mock always succeeds on, so expect empty dead-letter.

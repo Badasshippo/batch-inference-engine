@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-inference-engine
+  labels: { app: batch-inference-engine }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: batch-inference-engine }
+  template:
+    metadata:
+      labels: { app: batch-inference-engine }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: api
+          # Push to DOCR first: registry.digitalocean.com/<registry>/batch-inference-engine:latest
+          image: registry.digitalocean.com/REPLACE_ME/batch-inference-engine:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: WORKER_POOL_SIZE, value: "32" }
+            - { name: GLOBAL_MAX_CONCURRENCY, value: "64" }
+            - { name: MAX_ACTIVE_JOBS, value: "50" }
+            - { name: PROVIDER_MAX_RPS, value: "200" }
+            - { name: GRACEFUL_SHUTDOWN_SECONDS, value: "20" }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }   # let LB drain before SIGTERM
+      terminationGracePeriodSeconds: 30           # >= GRACEFUL_SHUTDOWN_SECONDS

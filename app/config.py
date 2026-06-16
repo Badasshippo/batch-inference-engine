@@ -65,6 +65,10 @@ class Settings:
     # How long to let in-flight prompts finish during a graceful shutdown.
     graceful_shutdown_seconds: float = _get_float("GRACEFUL_SHUTDOWN_SECONDS", 10.0)
 
+    # Optional API-key auth. Empty => auth disabled (open). When set, requests to
+    # the versioned API must send a matching `X-API-Key` header.
+    api_key: str = os.environ.get("API_KEY", "")
+
     # Retry / backoff policy for HTTP 429 (and transient errors).
     max_retries: int = _get_int("MAX_RETRIES", 5)
     backoff_base_seconds: float = _get_float("BACKOFF_BASE_SECONDS", 0.2)

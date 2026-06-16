@@ -288,9 +288,15 @@ class BatchEngine:
                 job_id, item = got
                 metrics.queue_depth.set(self.scheduler.pending)
                 metrics.inflight.set(self._limiter.in_use)
-                await self._process(job_id, item)
+                try:
+                    await self._process(job_id, item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - never let one item kill the worker
+                    log.exception("worker error processing item", extra={"job_id": job_id})
             finally:
                 await self._limiter.release()
+                metrics.inflight.set(self._limiter.in_use)
 
     async def _gated_infer(self, prompt: str) -> str:
         # Proactive global RPS cap before every upstream call.

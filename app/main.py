@@ -8,10 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import __version__
@@ -21,12 +33,24 @@ from .metrics import metrics
 from .models import (
     BatchRequest,
     DeadLetterResponse,
-    JobResultsResponse,
+    JobsListResponse,
     JobStatusResponse,
+    JobResultsResponse,
+    JobSummary,
     Priority,
     PromptItem,
     SubmitResponse,
 )
+
+
+async def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    """Optional API-key gate. No-op unless API_KEY is configured.
+
+    Reads the environment live so the key can be rotated without a code change.
+    """
+    expected = os.environ.get("API_KEY", "")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 log = get_logger("api")
 
@@ -146,7 +170,40 @@ async def root() -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 # Versioned API router
 # --------------------------------------------------------------------------- #
-api = APIRouter(tags=["batches"])
+api = APIRouter(tags=["batches"], dependencies=[Depends(require_api_key)])
+
+
+@api.get("/jobs", response_model=JobsListResponse)
+async def list_jobs(
+    request: Request,
+    state: str | None = Query(default=None, description="Filter by job state."),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> JobsListResponse:
+    """List jobs (newest first), optionally filtered by state."""
+    jobs = sorted(_engine(request).store.all(), key=lambda j: j.created_at, reverse=True)
+    if state:
+        jobs = [j for j in jobs if j.state.value == state]
+    page = jobs[offset : offset + limit]
+    return JobsListResponse(
+        total=len(jobs),
+        returned=len(page),
+        limit=limit,
+        offset=offset,
+        jobs=[
+            JobSummary(
+                job_id=j.id,
+                state=j.state,
+                priority=j.priority,
+                total=j.total,
+                completed=j.completed,
+                succeeded=j.succeeded,
+                failed=j.failed,
+                created_at=j.created_at,
+            )
+            for j in page
+        ],
+    )
 
 
 @api.post("/batches", response_model=SubmitResponse, status_code=status.HTTP_202_ACCEPTED)

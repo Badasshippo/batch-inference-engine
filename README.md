@@ -181,6 +181,7 @@ All batch/job routes are available under `/v1` (canonical) and at the root path
 |---|---|---|
 | `POST` | `/v1/batches` | Submit a JSON batch `{ "prompts": [...], "priority": "high\|normal\|low" }`. Honors `Idempotency-Key`. Returns `202` + `job_id`. |
 | `POST` | `/v1/batches/upload?priority=` | Submit a batch as a `.json` file (bare array or `{prompts:[...]}`). |
+| `GET`  | `/v1/jobs?state=&limit=&offset=` | List jobs (newest first), optionally filtered by state. |
 | `GET`  | `/v1/jobs/{job_id}` | Real-time progress (state, progress, pending, retries, cost). |
 | `GET`  | `/v1/jobs/{job_id}/results?limit=&offset=` | Paginated aggregated results. |
 | `GET`  | `/v1/jobs/{job_id}/dead-letter?limit=&offset=` | Failed prompts (dead-letter queue). |
@@ -194,6 +195,9 @@ All batch/job routes are available under `/v1` (canonical) and at the root path
 Headers: send `Idempotency-Key` on submit for safe retries; every response
 carries an `X-Request-ID` (echoed if you provide one). When the engine is at
 capacity (`MAX_ACTIVE_JOBS`), submits return `503` with a `Retry-After` header.
+
+**Auth (optional):** set `API_KEY` to require an `X-API-Key` header on all `/v1`
+routes (health and `/metrics` stay open). Unset by default.
 
 ---
 
@@ -215,6 +219,7 @@ All settings are environment variables (see [`app/config.py`](app/config.py)):
 | `MAX_ACTIVE_JOBS` | `50` | Active jobs before submit returns `503 + Retry-After`. |
 | `OVERLOAD_RETRY_AFTER_SECONDS` | `5` | `Retry-After` value sent when overloaded. |
 | `GRACEFUL_SHUTDOWN_SECONDS` | `10` | Drain window for in-flight prompts on shutdown. |
+| `API_KEY` | _(unset)_ | If set, require `X-API-Key` on `/v1` routes. |
 | `MAX_RETRIES` | `5` | Retry attempts per prompt on 429. |
 | `BACKOFF_BASE_SECONDS` | `0.2` | Base for exponential backoff. |
 | `BACKOFF_MAX_SECONDS` | `10.0` | Backoff ceiling. |
@@ -300,6 +305,8 @@ docs/
   deploy-digitalocean.md     # App Platform + DOKS deployment guide
 Dockerfile             # non-root, healthcheck, honors $PORT
 .dockerignore
+.do/app.yaml           # DigitalOcean App Platform spec
+k8s/                   # DOKS manifests: deployment, service, HPA
 .github/workflows/ci.yml
 ```
 

@@ -1,0 +1,44 @@
+# DigitalOcean App Platform spec.
+# Deploy:  doctl apps create --spec .do/app.yaml
+# Update:  doctl apps update <APP_ID> --spec .do/app.yaml
+name: batch-inference-engine
+region: nyc
+services:
+  - name: api
+    github:
+      repo: Badasshippo/batch-inference-engine
+      branch: master
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    health_check:
+      http_path: /readyz
+      initial_delay_seconds: 5
+      period_seconds: 10
+      failure_threshold: 3
+    envs:
+      - key: WORKER_POOL_SIZE
+        scope: RUN_TIME
+        value: "32"
+      - key: GLOBAL_MAX_CONCURRENCY
+        scope: RUN_TIME
+        value: "64"
+      - key: MAX_ACTIVE_JOBS
+        scope: RUN_TIME
+        value: "50"
+      - key: PROVIDER_MAX_RPS
+        scope: RUN_TIME
+        value: "200"
+      - key: GRACEFUL_SHUTDOWN_SECONDS
+        scope: RUN_TIME
+        value: "20"
+      - key: LOG_LEVEL
+        scope: RUN_TIME
+        value: "INFO"
+      # Set an API key as an encrypted secret to require X-API-Key on /v1.
+      # - key: API_KEY
+      #   scope: RUN_TIME
+      #   type: SECRET
+      #   value: "EV[...]"

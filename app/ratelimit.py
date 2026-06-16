@@ -27,7 +27,7 @@ class TokenBucket:
         self._last = None  # set lazily on the running loop
 
     def _now(self) -> float:
-        return asyncio.get_event_loop().time()
+        return asyncio.get_running_loop().time()
 
     def _refill(self) -> None:
         now = self._now()
