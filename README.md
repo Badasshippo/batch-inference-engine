@@ -161,6 +161,41 @@ docker run --rm -p 8080:8080 -e WORKER_POOL_SIZE=32 batch-inference-engine
 # -> http://127.0.0.1:8080/docs   |   /metrics   |   /healthz
 ```
 
+### Cloud smoke test
+
+Verify every platform invariant on the live deployment with one command:
+
+```bash
+BASE=https://batch-inference-engine-vl6nx.ondigitalocean.app
+curl -s -X POST "$BASE/v1/system/self-test?n=50" | jq
+```
+
+Returns a structured report — HTTP 200 means all checks green, HTTP 500 means a regression:
+
+```json
+{
+  "status": "passed",
+  "prompts": 50,
+  "duration_seconds": 1.84,
+  "throughput_rps": 27.2,
+  "ack_latency_ms": 3.1,
+  "retries": 7,
+  "rate_limit_handling": "observed_429s_and_recovered",
+  "peak_inflight_observed": 32,
+  "concurrency_cap": 64,
+  "checks": {
+    "immediate_ack": true,
+    "all_prompts_aggregated": true,
+    "no_prompts_dropped": true,
+    "retry_recovery_observed": true,
+    "concurrency_cap_respected": true,
+    "queue_drained": true,
+    "idempotency_roundtrip": true,
+    "fair_scheduling": true
+  }
+}
+```
+
 ### Observability
 
 ```bash
@@ -189,6 +224,7 @@ All batch/job routes are available under `/v1` (canonical) and at the root path
 | `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a running job. |
 | `GET`  | `/v1/jobs/{job_id}/events` | Server-Sent Events lifecycle stream. |
 | `GET`  | `/v1/system/capacity` | Live capacity (active jobs, queue depth, in-flight, concurrency limit). |
+| `POST` | `/v1/system/self-test?n=50` | Built-in invariant smoke test — returns structured pass/fail report. |
 | `GET`  | `/metrics` | Prometheus metrics (text exposition format). |
 | `GET`  | `/healthz` · `/livez` · `/readyz` | Health: basic · liveness · readiness. |
 | `GET`  | `/docs` | Swagger UI. |

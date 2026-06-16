@@ -211,6 +211,25 @@ async def list_jobs(
     )
 
 
+@api.post("/system/self-test")
+async def system_self_test(
+    request: Request,
+    n: int = Query(default=50, ge=5, le=200, description="Number of synthetic prompts"),
+) -> JSONResponse:
+    """Run a built-in invariant smoke test against the live platform.
+
+    Submits *n* synthetic prompts (priority=low), verifies concurrency bounds,
+    retry-recovery, idempotency, fair scheduling, and result aggregation, then
+    returns a structured pass/fail report. HTTP 200 = all invariants green.
+    HTTP 500 = regression detected.
+    """
+    from .selftest import run_self_test
+
+    result = await run_self_test(_engine(request), n=n)
+    code = 200 if result.get("status") == "passed" else 500
+    return JSONResponse(content=result, status_code=code)
+
+
 @api.get("/system/capacity")
 async def system_capacity(request: Request) -> dict:
     """Live capacity snapshot for dashboards / autoscaling decisions."""
